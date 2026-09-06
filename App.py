@@ -1,14 +1,14 @@
-import base64
 import datetime
 import io
+import json
 import math
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import bcrypt
-import openai
+from google import genai
+from google.genai import types
 from PIL import Image
 import pypdf
-from pydantic import BaseModel
 import streamlit as st
 from supabase import Client, create_client
 
@@ -30,41 +30,19 @@ def init_supabase() -> Client:
 
 supabase = init_supabase()
 
-# OpenRouter client configuration using OpenAI SDK
-client = openai.OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=st.secrets["OPENROUTER_API_KEY"],
-    default_headers={
-        "HTTP-Referer": "https://streamlit.io",
-        "X-Title": "AI Flashcard Hub",
-    },
-)
+# Google Gemini client configuration
+# Add GEMINI_API_KEY to your Streamlit secrets (.streamlit/secrets.toml)
+client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
-MODEL_NAME = "openai/gpt-4o-mini"
+# GEMINI MODEL IDENTIFIER
+MODEL_NAME = "gemini-2.5-flash"
 
 if "user" not in st.session_state:
     st.session_state.user = None
 
 # ==========================================
-# 2. SCHEMAS & AUTHENTICATION
+# 2. AUTHENTICATION HELPERS
 # ==========================================
-
-
-class Flashcard(BaseModel):
-    subject: str
-    question: str
-    diagram: Optional[str] = None
-    answer: str
-
-
-class FlashcardResponse(BaseModel):
-    cards: List[Flashcard]
-
-
-class AnswerEvaluation(BaseModel):
-    is_correct: bool
-    quality: int
-    feedback: str
 
 
 def hash_password(password: str) -> str:
@@ -77,7 +55,7 @@ def verify_password(password: str, hashed: str) -> bool:
     return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
 
 
-def register_user(username, password):
+def register_user(username: str, password: str) -> Tuple[bool, str]:
     hashed = hash_password(password)
     res = (
         supabase.table("users")
@@ -94,7 +72,7 @@ def register_user(username, password):
     return True, "Account created successfully! Please log in."
 
 
-def login_user(username, password):
+def login_user(username: str, password: str) -> Tuple[bool, str]:
     res = (
         supabase.table("users")
         .select("*")
@@ -119,7 +97,7 @@ def login_user(username, password):
 # ==========================================
 
 
-def save_cards(user_id, cards):
+def save_cards(user_id: str, cards: List[dict]):
     today_str = datetime.date.today().isoformat()
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -139,10 +117,11 @@ def save_cards(user_id, cards):
                 "next_review": today_str,
             }
         )
-    supabase.table("flashcards").insert(records).execute()
+    if records:
+        supabase.table("flashcards").insert(records).execute()
 
 
-def get_cards_by_subject(user_id, subject="All"):
+def get_cards_by_subject(user_id: str, subject: str = "All") -> List[dict]:
     query = supabase.table("flashcards").select("*").eq("user_id", user_id)
     if subject != "All":
         query = query.eq("subject", subject)
@@ -150,7 +129,7 @@ def get_cards_by_subject(user_id, subject="All"):
     return res.data or []
 
 
-def get_all_subjects(user_id):
+def get_all_subjects(user_id: str) -> List[str]:
     res = (
         supabase.table("flashcards")
         .select("subject")
@@ -159,10 +138,12 @@ def get_all_subjects(user_id):
     )
     if not res.data:
         return []
-    return list(set([r["subject"] for r in res.data if r["subject"]]))
+    return sorted(list({r["subject"] for r in res.data if r.get("subject")}))
 
 
-def update_card_review(card_id, quality, current_rep, current_int, current_ef):
+def update_card_review(
+    card_id: str, quality: int, current_rep: int, current_int: int, current_ef: float
+):
     if quality >= 3:
         if current_rep == 0:
             new_int = 1
@@ -197,36 +178,30 @@ def update_card_review(card_id, quality, current_rep, current_int, current_ef):
     ).eq("id", card_id).execute()
 
 
-def delete_card(card_id):
+def delete_card(card_id: str):
     supabase.table("flashcards").delete().eq("id", card_id).execute()
 
 
 # ==========================================
-# 4. HELPER & OPENROUTER FUNCTIONS
+# 4. HELPER & GEMINI FUNCTIONS
 # ==========================================
 
 
-def extract_text_from_pdf(pdf_file):
+def extract_text_from_pdf(pdf_file) -> str:
     try:
         reader = pypdf.PdfReader(pdf_file)
-        extracted_text = ""
+        extracted_text = []
         for page in reader.pages:
             text = page.extract_text()
             if text:
-                extracted_text += text + "\n"
-        return extracted_text
+                extracted_text.append(text)
+        return "\n".join(extracted_text)
     except Exception as e:
         st.error(f"Error reading PDF file: {e}")
         return ""
 
 
-def encode_image(image_input):
-    buffered = io.BytesIO()
-    image_input.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-
-def get_review_status(last_reviewed_str):
+def get_review_status(last_reviewed_str: Optional[str]) -> Tuple[str, bool]:
     if not last_reviewed_str:
         return "Needs Review", False
     try:
@@ -241,71 +216,96 @@ def get_review_status(last_reviewed_str):
         return "Needs Review", False
 
 
-def generate_cards_with_openrouter(
-    contents_input, num_cards=5, existing_subjects=None
-):
+def generate_cards_with_gemini(
+    contents_input, num_cards: int = 5, existing_subjects: Optional[List[str]] = None
+) -> dict:
     if not existing_subjects:
         existing_subjects = ["General"]
     existing_str = ", ".join(f'"{s}"' for s in existing_subjects)
 
     system_prompt = f"""
     Analyze the provided content and generate {num_cards} flashcards.
+
     CATEGORIZATION & FORMATTING RULES:
     1. Prefer choosing a subject from this existing list if it fits well: [{existing_str}].
     2. If NONE fit, create a NEW concise subject name (1-3 words).
-    3. MATHEMATICS & FORMULAS: Format all equations, formulas, and math symbols using LaTeX delimiters.
-       - Use single dollars for inline math (e.g. $x^2 + y^2 = r^2$).
-       - Use double dollars for display-style equations (e.g. $$\\int_{{a}}^{{b}} f(x) \\, dx$$).
-    4. DIAGRAMS: If a question benefits from a visual diagram, generate a clean ASCII art diagram inside the "diagram" key. If not needed, set to null.
+    3. MATHEMATICS & FORMULAS: Format all equations using LaTeX ($x^2$ or $$\\int x$$).
+    4. DIAGRAMS: Generate ASCII art in "diagram" if useful, otherwise null.
     """
 
+    # Schema definition for structured response
+    card_schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "subject": types.Schema(type=types.Type.STRING),
+            "question": types.Schema(type=types.Type.STRING),
+            "diagram": types.Schema(type=types.Type.STRING, nullable=True),
+            "answer": types.Schema(type=types.Type.STRING),
+        },
+        required=["subject", "question", "answer"],
+    )
+
+    response_schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "cards": types.Schema(
+                type=types.Type.ARRAY, items=card_schema
+            )
+        },
+        required=["cards"],
+    )
+
+    contents = []
     if isinstance(contents_input, Image.Image):
-        base64_image = encode_image(contents_input)
-        user_content = [
-            {
-                "type": "text",
-                "text": f"Generate {num_cards} flashcards from this image.",
-            },
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{base64_image}"},
-            },
-        ]
+        contents.append(contents_input)
+        contents.append(f"Generate {num_cards} flashcards from this image.")
     else:
-        user_content = f"Content:\n{contents_input[:4000]}"
+        contents.append(f"Content:\n{contents_input[:4000]}")
 
     try:
-        response = client.beta.chat.completions.parse(
+        response = client.models.generate_content(
             model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            response_format=FlashcardResponse,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                response_mime_type="application/json",
+                response_schema=response_schema,
+            ),
         )
-        parsed_result = response.choices[0].message.parsed
-        cards_dict = [card.model_dump() for card in parsed_result.cards]
-        return {"success": True, "cards": cards_dict}
+        data = json.loads(response.text)
+        return {"success": True, "cards": data.get("cards", [])}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def evaluate_answer(user_ans, correct_ans, question):
-    eval_prompt = f"Question: {question}\nCorrect: {correct_ans}\nUser: {user_ans}\nRate quality (0-5) and provide short feedback."
+def evaluate_answer(user_ans: str, correct_ans: str, question: str) -> dict:
+    eval_prompt = f"""
+    Question: {question}
+    Correct Answer: {correct_ans}
+    User Answer: {user_ans}
+    """
+
+    eval_schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "is_correct": types.Schema(type=types.Type.BOOLEAN),
+            "quality": types.Schema(type=types.Type.INTEGER),
+            "feedback": types.Schema(type=types.Type.STRING),
+        },
+        required=["is_correct", "quality", "feedback"],
+    )
+
     try:
-        response = client.beta.chat.completions.parse(
+        response = client.models.generate_content(
             model=MODEL_NAME,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You evaluate flashcard quiz responses.",
-                },
-                {"role": "user", "content": eval_prompt},
-            ],
-            response_format=AnswerEvaluation,
+            contents=eval_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction="You evaluate flashcard quiz responses. Assess accuracy, rate quality between 0 and 5, and provide brief feedback.",
+                response_mime_type="application/json",
+                response_schema=eval_schema,
+            ),
         )
-        parsed_result = response.choices[0].message.parsed
-        return parsed_result.model_dump()
+        return json.loads(response.text)
     except Exception:
         return {
             "is_correct": False,
@@ -390,9 +390,9 @@ with tab1:
             payload = text_input.strip()
 
         if payload:
-            with st.spinner("Generating via OpenRouter..."):
+            with st.spinner("Generating via Gemini AI..."):
                 existing = get_all_subjects(user["id"])
-                res = generate_cards_with_openrouter(
+                res = generate_cards_with_gemini(
                     payload, card_count, existing
                 )
                 if res["success"]:
@@ -401,6 +401,8 @@ with tab1:
                     st.rerun()
                 else:
                     st.error(res["error"])
+        else:
+            st.warning("Please upload a file or paste text content first.")
 
 # TAB 2: QUIZ
 with tab2:
@@ -454,10 +456,10 @@ with tab2:
                 if st.session_state.get("eval"):
                     res = st.session_state.eval
                     st.divider()
-                    if res["is_correct"]:
-                        st.success(f"Feedback: {res['feedback']}")
+                    if res.get("is_correct"):
+                        st.success(f"Feedback: {res.get('feedback', '')}")
                     else:
-                        st.error(f"Feedback: {res['feedback']}")
+                        st.error(f"Feedback: {res.get('feedback', '')}")
 
                 if st.session_state.get("show_ans"):
                     st.markdown("**Expected Answer:**")

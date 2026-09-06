@@ -1,5 +1,6 @@
 streamlit
-google-genai
+openai
+pydantic
 supabase
 bcrypt
 pypdf

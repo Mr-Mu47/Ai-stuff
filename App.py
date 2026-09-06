@@ -23,7 +23,8 @@ def init_supabase() -> Client:
     return create_client(url, key)
 
 supabase = init_supabase()
-client = genai.Client()
+# Pass the key directly from secrets
+client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 # Session State for Auth
 if "user" not in st.session_state:
@@ -184,7 +185,7 @@ def generate_cards_with_gemini(contents_input, num_cards=5, existing_subjects=No
 
     try:
         response = client.models.generate_content(
-            model="gemini-3.5-flash",
+            model="gemini-3.7-flash",
             contents=contents,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -208,7 +209,7 @@ def evaluate_answer(user_ans, correct_ans, question):
     )
     try:
         response = client.models.generate_content(
-            model="gemini-3.5-flash",
+            model="gemini-3.7-flash",
             contents=eval_prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
@@ -258,15 +259,18 @@ if not st.session_state.user:
 # 6. LOGGED-IN APP UI
 # ==========================================
 
-user = st.session_state.user
-st.sidebar.write(f"Logged in as: **{user['username']}**")
-if st.sidebar.button("Logout"):
-    st.session_state.user = None
-    st.rerun()
+# Safely check that session_state.user exists before running logged-in UI
+if st.session_state.user:
+    user = st.session_state.user
+    st.sidebar.write(f"Logged in as: **{user['username']}**")
+    
+    if st.sidebar.button("Logout"):
+        st.session_state.user = None
+        st.rerun()
 
-st.title("🧠 AI Flashcard Hub")
-tab1, tab2, tab3 = st.tabs(["⚡ Generate Cards", "🎴 Smart Quiz", "📚 Dashboard"])
-
+    st.title("🧠 AI Flashcard Hub")
+    tab1, tab2, tab3 = st.tabs(["⚡ Generate Cards", "🎴 Smart Quiz", "📚 Dashboard"])
+    
 # TAB 1: GENERATE
 with tab1:
     st.subheader("Generate New Flashcards")

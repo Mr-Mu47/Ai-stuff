@@ -1,5 +1,6 @@
 streamlit
 google-genai
+google-auth
 pydantic
 supabase
 bcrypt

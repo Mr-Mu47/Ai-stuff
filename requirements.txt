@@ -1,7 +1,7 @@
 streamlit
-openai
+google-genai
+pydantic
 supabase
 bcrypt
 pypdf
-pillow
-pydantic
+Pillow

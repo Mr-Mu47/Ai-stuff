@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 import bcrypt
 from google import genai
 from google.genai import types
+from google.oauth2.credentials import Credentials
 from PIL import Image
 import pypdf
 import streamlit as st
@@ -30,12 +31,13 @@ def init_supabase() -> Client:
 
 supabase = init_supabase()
 
-# Google Gemini client configuration
-# Add GEMINI_API_KEY to your Streamlit secrets (.streamlit/secrets.toml)
-client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+# Initialize Google GenAI Client with OAuth 2.0 Token
+# Ensure OAUTH_ACCESS_TOKEN is present in .streamlit/secrets.toml
+oauth_credentials = Credentials(token=st.secrets["OAUTH_ACCESS_TOKEN"])
+client = genai.Client(credentials=oauth_credentials)
 
 # GEMINI MODEL IDENTIFIER
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.5-flash"
 
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -233,7 +235,6 @@ def generate_cards_with_gemini(
     4. DIAGRAMS: Generate ASCII art in "diagram" if useful, otherwise null.
     """
 
-    # Schema definition for structured response
     card_schema = types.Schema(
         type=types.Type.OBJECT,
         properties={

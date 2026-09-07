@@ -30,7 +30,7 @@ def init_supabase() -> Client:
 
 supabase = init_supabase()
 
-# Initialize Google GenAI Client with HTTP options to properly route AQ. keys
+# Initialize Google GenAI Client
 try:
     api_key_val = st.secrets["GEMINI_API_KEY"]
     client = genai.Client(

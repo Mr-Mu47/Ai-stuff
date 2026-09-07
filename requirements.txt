@@ -1,8 +1,6 @@
 streamlit
 google-genai
-google-auth
-pydantic
 supabase
 bcrypt
+pillow
 pypdf
-Pillow

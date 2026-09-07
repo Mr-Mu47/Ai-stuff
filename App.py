@@ -30,10 +30,16 @@ def init_supabase() -> Client:
 
 supabase = init_supabase()
 
-# Initialize Google GenAI Client with API Key from Streamlit Secrets
-# Supports both new "AQ." format keys and legacy "AIzaSy..." format keys
+# Initialize Google GenAI Client with HTTP options to properly route AQ. keys
 try:
-    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    api_key_val = st.secrets["GEMINI_API_KEY"]
+    client = genai.Client(
+        api_key=api_key_val,
+        http_options=types.HttpOptions(
+            api_version="v1beta",
+            headers={"x-goog-api-key": api_key_val}
+        )
+    )
 except Exception as e:
     st.error("Missing or invalid `GEMINI_API_KEY` in Streamlit secrets.")
     st.stop()

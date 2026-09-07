@@ -7,7 +7,6 @@ from typing import List, Optional, Tuple
 import bcrypt
 from google import genai
 from google.genai import types
-from google.oauth2.credentials import Credentials
 from PIL import Image
 import pypdf
 import streamlit as st
@@ -31,13 +30,16 @@ def init_supabase() -> Client:
 
 supabase = init_supabase()
 
-# Initialize Google GenAI Client with OAuth 2.0 Token
-# Ensure OAUTH_ACCESS_TOKEN is present in .streamlit/secrets.toml
-oauth_credentials = Credentials(token=st.secrets["OAUTH_ACCESS_TOKEN"])
-client = genai.Client(credentials=oauth_credentials)
+# Initialize Google GenAI Client with API Key from Streamlit Secrets
+# Supports both new "AQ." format keys and legacy "AIzaSy..." format keys
+try:
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+except Exception as e:
+    st.error("Missing or invalid `GEMINI_API_KEY` in Streamlit secrets.")
+    st.stop()
 
 # GEMINI MODEL IDENTIFIER
-MODEL_NAME = "gemini-3.5-flash"
+MODEL_NAME = "gemini-2.5-flash"
 
 if "user" not in st.session_state:
     st.session_state.user = None

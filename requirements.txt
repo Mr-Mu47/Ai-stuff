@@ -2,5 +2,5 @@ streamlit
 google-genai
 supabase
 bcrypt
-pillow
 pypdf
+Pillow

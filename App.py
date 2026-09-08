@@ -243,7 +243,7 @@ def mark_model_overloaded(model_name: str):
     )
 
 
-def generate_content_smart_fallback(contents, config) -> str:
+def generate_content_smart_fallback(contents, config, status_container=None) -> str:
     """Cascade router: Tries the first healthy model and fails over dynamically on demand errors."""
     errors_encountered = []
 
@@ -253,6 +253,8 @@ def generate_content_smart_fallback(contents, config) -> str:
             continue
 
         try:
+            if status_container:
+                status_container.write(f"🔄 Requesting via `{model}`...")
             response = client.models.generate_content(
                 model=model,
                 contents=contents,
@@ -264,10 +266,10 @@ def generate_content_smart_fallback(contents, config) -> str:
             err_code = getattr(e, "code", None)
             if err_code in (429, 503):
                 mark_model_overloaded(model)
-                st.warning(
-                    f"Model `{model}` is experiencing heavy demand (HTTP {err_code}). "
-                    f"Placing on 60s cooldown and routing to fallback..."
-                )
+                if status_container:
+                    status_container.write(
+                        f"⚠️ Model `{model}` hit heavy load (HTTP {err_code}). Retrying with fallback..."
+                    )
                 errors_encountered.append(f"{model}: {e}")
                 continue
             # Re-raise non-demand errors immediately (e.g. invalid arguments)
@@ -283,7 +285,7 @@ def generate_content_smart_fallback(contents, config) -> str:
 
 
 def generate_cards_with_gemini(
-    contents_input, num_cards: int = 5, existing_subjects: Optional[List[str]] = None
+    contents_input, num_cards: int = 5, existing_subjects: Optional[List[str]] = None, status_container=None
 ) -> dict:
     if not existing_subjects:
         existing_subjects = ["General"]
@@ -334,7 +336,7 @@ def generate_cards_with_gemini(
     )
 
     try:
-        response_text = generate_content_smart_fallback(contents, config)
+        response_text = generate_content_smart_fallback(contents, config, status_container)
         data = json.loads(response_text)
         return {"success": True, "cards": data.get("cards", [])}
     except Exception as e:
@@ -458,17 +460,29 @@ with tab1:
             payload = text_input.strip()
 
         if payload:
-            with st.spinner("Generating via Gemini AI..."):
-                existing = get_all_subjects(user["id"])
-                res = generate_cards_with_gemini(
-                    payload, card_count, existing
+            status = st.status("Initializing AI flashcard generation...", expanded=True)
+            existing = get_all_subjects(user["id"])
+            res = generate_cards_with_gemini(
+                payload, card_count, existing, status_container=status
+            )
+            
+            if res["success"]:
+                status.write("💾 Saving flashcards to database...")
+                save_cards(user["id"], res["cards"])
+                status.update(
+                    label=f"✅ Finished! Generated and saved {len(res['cards'])} flashcards.",
+                    state="complete",
+                    expanded=False
                 )
-                if res["success"]:
-                    save_cards(user["id"], res["cards"])
-                    st.success(f"Generated {len(res['cards'])} cards!")
-                    st.rerun()
-                else:
-                    st.error(res["error"])
+                time.sleep(1)
+                st.rerun()
+            else:
+                status.update(
+                    label="❌ Generation failed.",
+                    state="error",
+                    expanded=True
+                )
+                st.error(res["error"])
         else:
             st.warning("Please upload a file or paste text content first.")
 
@@ -508,18 +522,19 @@ with tab2:
 
                 user_ans = st.text_input("Your Answer:", key=f"ans_{idx}")
                 if st.button("Submit Answer", type="primary", key=f"sub_{idx}"):
-                    eval_res = evaluate_answer(
-                        user_ans, card["answer"], card["question"]
-                    )
-                    st.session_state.eval = eval_res
-                    st.session_state.show_ans = True
-                    update_card_review(
-                        card["id"],
-                        eval_res.get("quality", 3),
-                        card["repetition"],
-                        card["interval"],
-                        card["efactor"],
-                    )
+                    with st.spinner("Evaluating answer..."):
+                        eval_res = evaluate_answer(
+                            user_ans, card["answer"], card["question"]
+                        )
+                        st.session_state.eval = eval_res
+                        st.session_state.show_ans = True
+                        update_card_review(
+                            card["id"],
+                            eval_res.get("quality", 3),
+                            card["repetition"],
+                            card["interval"],
+                            card["efactor"],
+                        )
 
                 if st.session_state.get("eval"):
                     res = st.session_state.eval

@@ -33,19 +33,13 @@ supabase = init_supabase()
 # Initialize Google GenAI Client
 try:
     api_key_val = st.secrets["GEMINI_API_KEY"]
-    client = genai.Client(
-        api_key=api_key_val,
-        http_options=types.HttpOptions(
-            api_version="v1beta",
-            headers={"x-goog-api-key": api_key_val}
-        )
-    )
+    client = genai.Client(api_key=api_key_val)
 except Exception as e:
     st.error("Missing or invalid `GEMINI_API_KEY` in Streamlit secrets.")
     st.stop()
 
 # GEMINI MODEL IDENTIFIER
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.5-flash"
 
 if "user" not in st.session_state:
     st.session_state.user = None

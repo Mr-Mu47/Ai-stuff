@@ -44,7 +44,7 @@ except Exception as e:
     st.stop()
 
 # SMART FALLBACK MODEL LIST (Ordered by preference)
-MODEL_CASCADE = ["gemini-3.8-flash", "gemini-2.5-flash"]
+MODEL_CASCADE = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 COOLDOWN_PERIOD_SECONDS = 60
 
 # Initialize in-memory model cooldown tracker

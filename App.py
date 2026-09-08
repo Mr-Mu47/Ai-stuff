@@ -43,8 +43,8 @@ except Exception as e:
     st.stop()
 
 # MODEL ORDER FOR DEMAND FALLBACK
-PRIMARY_MODEL = "gemini-3.7-flash"
-FALLBACK_MODEL = "gemini-3.1-flash"
+PRIMARY_MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
 if "user" not in st.session_state:
     st.session_state.user = None

@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 import bcrypt
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 from PIL import Image
 import pypdf
 import streamlit as st
@@ -40,8 +41,10 @@ try:
 except Exception as e:
     st.error(f"Missing or invalid `GEMINI_API_KEY` in Streamlit secrets: {e}")
     st.stop()
-# GEMINI MODEL IDENTIFIER
-MODEL_NAME = "gemini-3.5-flash"
+
+# MODEL ORDER FOR DEMAND FALLBACK
+PRIMARY_MODEL = "gemini-3.7-flash"
+FALLBACK_MODEL = "gemini-3.1-flash"
 
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -222,6 +225,30 @@ def get_review_status(last_reviewed_str: Optional[str]) -> Tuple[str, bool]:
         return "Needs Review", False
 
 
+def generate_content_with_fallback(contents, config) -> str:
+    """Helper to try generating content with primary model and fallback if busy."""
+    try:
+        response = client.models.generate_content(
+            model=PRIMARY_MODEL,
+            contents=contents,
+            config=config,
+        )
+        return response.text
+    except APIError as e:
+        if getattr(e, "code", None) in (429, 503):
+            st.warning(
+                f"Primary model ({PRIMARY_MODEL}) is experiencing heavy load. "
+                f"Switching to fallback model ({FALLBACK_MODEL})..."
+            )
+            response = client.models.generate_content(
+                model=FALLBACK_MODEL,
+                contents=contents,
+                config=config,
+            )
+            return response.text
+        raise e
+
+
 def generate_cards_with_gemini(
     contents_input, num_cards: int = 5, existing_subjects: Optional[List[str]] = None
 ) -> dict:
@@ -267,17 +294,15 @@ def generate_cards_with_gemini(
     else:
         contents.append(f"Content:\n{contents_input[:4000]}")
 
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        response_mime_type="application/json",
+        response_schema=response_schema,
+    )
+
     try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                response_mime_type="application/json",
-                response_schema=response_schema,
-            ),
-        )
-        data = json.loads(response.text)
+        response_text = generate_content_with_fallback(contents, config)
+        data = json.loads(response_text)
         return {"success": True, "cards": data.get("cards", [])}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -300,17 +325,15 @@ def evaluate_answer(user_ans: str, correct_ans: str, question: str) -> dict:
         required=["is_correct", "quality", "feedback"],
     )
 
+    config = types.GenerateContentConfig(
+        system_instruction="You evaluate flashcard quiz responses. Assess accuracy, rate quality between 0 and 5, and provide brief feedback.",
+        response_mime_type="application/json",
+        response_schema=eval_schema,
+    )
+
     try:
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=eval_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction="You evaluate flashcard quiz responses. Assess accuracy, rate quality between 0 and 5, and provide brief feedback.",
-                response_mime_type="application/json",
-                response_schema=eval_schema,
-            ),
-        )
-        return json.loads(response.text)
+        response_text = generate_content_with_fallback(eval_prompt, config)
+        return json.loads(response_text)
     except Exception:
         return {
             "is_correct": False,

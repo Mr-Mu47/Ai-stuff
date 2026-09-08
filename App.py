@@ -2,6 +2,7 @@ import datetime
 import io
 import json
 import math
+import time
 from typing import List, Optional, Tuple
 
 import bcrypt
@@ -36,15 +37,19 @@ try:
     api_key_val = st.secrets.get("GEMINI_API_KEY")
     if not api_key_val or not str(api_key_val).strip():
         raise ValueError("GEMINI_API_KEY is empty or missing from secrets.")
-    
+
     client = genai.Client(api_key=api_key_val)
 except Exception as e:
     st.error(f"Missing or invalid `GEMINI_API_KEY` in Streamlit secrets: {e}")
     st.stop()
 
-# MODEL ORDER FOR DEMAND FALLBACK
-PRIMARY_MODEL = "gemini-3.8-flash"
-FALLBACK_MODEL = "gemini-3.5-flash-lite"
+# SMART FALLBACK MODEL LIST (Ordered by preference)
+MODEL_CASCADE = ["gemini-3.8-flash", "gemini-2.5-flash"]
+COOLDOWN_PERIOD_SECONDS = 60
+
+# Initialize in-memory model cooldown tracker
+if "model_cooldowns" not in st.session_state:
+    st.session_state.model_cooldowns = {}
 
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -192,7 +197,7 @@ def delete_card(card_id: str):
 
 
 # ==========================================
-# 4. HELPER & GEMINI FUNCTIONS
+# 4. SMART FALLBACK & GEMINI FUNCTIONS
 # ==========================================
 
 
@@ -225,28 +230,56 @@ def get_review_status(last_reviewed_str: Optional[str]) -> Tuple[str, bool]:
         return "Needs Review", False
 
 
-def generate_content_with_fallback(contents, config) -> str:
-    """Helper to try generating content with primary model and fallback if busy."""
-    try:
-        response = client.models.generate_content(
-            model=PRIMARY_MODEL,
-            contents=contents,
-            config=config,
-        )
-        return response.text
-    except APIError as e:
-        if getattr(e, "code", None) in (429, 503):
-            st.warning(
-                f"Primary model ({PRIMARY_MODEL}) is experiencing heavy load. "
-                f"Switching to fallback model ({FALLBACK_MODEL})..."
-            )
+def is_model_available(model_name: str) -> bool:
+    """Checks whether a model is out of its demand cooldown period."""
+    cooldown_until = st.session_state.model_cooldowns.get(model_name, 0)
+    return time.time() > cooldown_until
+
+
+def mark_model_overloaded(model_name: str):
+    """Puts a model in cooldown mode to bypass it during high-demand windows."""
+    st.session_state.model_cooldowns[model_name] = (
+        time.time() + COOLDOWN_PERIOD_SECONDS
+    )
+
+
+def generate_content_smart_fallback(contents, config) -> str:
+    """Cascade router: Tries the first healthy model and fails over dynamically on demand errors."""
+    errors_encountered = []
+
+    for model in MODEL_CASCADE:
+        # Skip models currently marked as overloaded/in cooldown
+        if not is_model_available(model):
+            continue
+
+        try:
             response = client.models.generate_content(
-                model=FALLBACK_MODEL,
+                model=model,
                 contents=contents,
                 config=config,
             )
             return response.text
-        raise e
+
+        except APIError as e:
+            err_code = getattr(e, "code", None)
+            if err_code in (429, 503):
+                mark_model_overloaded(model)
+                st.warning(
+                    f"Model `{model}` is experiencing heavy demand (HTTP {err_code}). "
+                    f"Placing on 60s cooldown and routing to fallback..."
+                )
+                errors_encountered.append(f"{model}: {e}")
+                continue
+            # Re-raise non-demand errors immediately (e.g. invalid arguments)
+            raise e
+        except Exception as e:
+            errors_encountered.append(f"{model}: {e}")
+            continue
+
+    raise RuntimeError(
+        "All models in the cascade are currently experiencing high demand or errors. "
+        f"Details: {'; '.join(errors_encountered)}"
+    )
 
 
 def generate_cards_with_gemini(
@@ -301,7 +334,7 @@ def generate_cards_with_gemini(
     )
 
     try:
-        response_text = generate_content_with_fallback(contents, config)
+        response_text = generate_content_smart_fallback(contents, config)
         data = json.loads(response_text)
         return {"success": True, "cards": data.get("cards", [])}
     except Exception as e:
@@ -332,13 +365,13 @@ def evaluate_answer(user_ans: str, correct_ans: str, question: str) -> dict:
     )
 
     try:
-        response_text = generate_content_with_fallback(eval_prompt, config)
+        response_text = generate_content_smart_fallback(eval_prompt, config)
         return json.loads(response_text)
     except Exception:
         return {
             "is_correct": False,
             "quality": 1,
-            "feedback": "Evaluation failed.",
+            "feedback": "Evaluation failed due to temporary AI service overload.",
         }
 
 
@@ -383,6 +416,13 @@ if not st.session_state.user:
 
 user = st.session_state.user
 st.sidebar.write(f"Logged in as: **{user['username']}**")
+
+# Display system health indicator in the sidebar
+st.sidebar.divider()
+st.sidebar.caption("🤖 Model Status")
+for m in MODEL_CASCADE:
+    status = "🟢 Ready" if is_model_available(m) else "🔴 Heavy Load (Cooldown)"
+    st.sidebar.text(f"{m}: {status}")
 
 if st.sidebar.button("Logout"):
     st.session_state.user = None

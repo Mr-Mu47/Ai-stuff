@@ -168,16 +168,23 @@ def update_card_review(card_id: str, quality: int, current_interval: int, curren
 # ==========================================
 
 def login_user(username, password):
-    res = supabase.table("users").select("*").eq("username", username).execute()
-    if res.data:
-        user = res.data[0]
-        if bcrypt.checkpw(password.encode("utf-8"), user["password_hash"].encode("utf-8")):
-            st.session_state.user = user
-            st.rerun()
+    if not username or not password:
+        st.error("Please provide both username and password.")
+        return
+
+    try:
+        res = supabase.table("users").select("*").eq("username", username).execute()
+        if res.data:
+            user = res.data[0]
+            if bcrypt.checkpw(password.encode("utf-8"), user["password_hash"].encode("utf-8")):
+                st.session_state.user = user
+                st.rerun()
+            else:
+                st.error("Invalid password.")
         else:
-            st.error("Invalid password.")
-    else:
-        st.error("User not found.")
+            st.error("User not found.")
+    except Exception as e:
+        st.error("Database connection failed. Please check if your Supabase project is active or verify your SUPABASE_URL environment variable.")
 
 def register_user(username, password):
     res = supabase.table("users").select("*").eq("username", username).execute()

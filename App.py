@@ -101,12 +101,22 @@ def calculate_forgetting_curve(last_reviewed: str, interval: int) -> tuple[float
     if not last_reviewed:
         return 0.0, "🔴 High Memory Decay (Needs Review)", "#FF4B4B"
 
-    # Handle timezone formatting
-    last_dt = datetime.datetime.fromisoformat(last_reviewed.replace("Z", "+00:00"))
     now = datetime.datetime.now(datetime.timezone.utc)
     
+    # Safely parse last_reviewed ISO string and enforce UTC timezone awareness
+    try:
+        clean_iso = str(last_reviewed).replace("Z", "+00:00")
+        last_dt = datetime.datetime.fromisoformat(clean_iso)
+        # Convert naive datetime to UTC aware if timezone info is missing
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            last_dt = last_dt.astimezone(datetime.timezone.utc)
+    except Exception:
+        last_dt = now
+
     elapsed_days = max((now - last_dt).total_seconds() / 86400.0, 0.001)
-    stability = max(interval, 1)
+    stability = max(interval if interval is not None else 1, 1)
 
     # Retention formula: R = e^(-t / S)
     retention = math.exp(-elapsed_days / stability) * 100

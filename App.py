@@ -1,585 +1,405 @@
-import datetime
-import io
-import json
+import os
 import math
-import time
-from typing import List, Optional, Tuple
-
+import datetime
 import bcrypt
+import json
+import streamlit as st
+import pandas as pd
+from supabase import create_client, Client
 from google import genai
 from google.genai import types
-from google.genai.errors import APIError
-from PIL import Image
-import pypdf
-import streamlit as st
-from supabase import Client, create_client
 
 # ==========================================
-# 1. INITIALIZATION & DATABASE
+# 1. INITIALIZATION & CONFIGURATION
 # ==========================================
 
 st.set_page_config(
-    page_title="Multi-User AI Flashcard Hub", page_icon="🧠", layout="centered"
+    page_title="Multi-User AI Flashcard Hub",
+    page_icon="🧠",
+    layout="wide"
 )
 
+# Initialize Supabase
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-@st.cache_resource
-def init_supabase() -> Client:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
-
-
-supabase = init_supabase()
-
-# Initialize Google GenAI Client
-try:
-    api_key_val = st.secrets.get("GEMINI_API_KEY")
-    if not api_key_val or not str(api_key_val).strip():
-        raise ValueError("GEMINI_API_KEY is empty or missing from secrets.")
-
-    client = genai.Client(api_key=api_key_val)
-except Exception as e:
-    st.error(f"Missing or invalid `GEMINI_API_KEY` in Streamlit secrets: {e}")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("Missing Supabase configuration. Set `SUPABASE_URL` and `SUPABASE_KEY` environment variables.")
     st.stop()
 
-# SMART FALLBACK MODEL LIST (Ordered by preference)
-MODEL_CASCADE = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
-COOLDOWN_PERIOD_SECONDS = 60
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Initialize in-memory model cooldown tracker
+# Initialize Session State
+if "user" not in st.session_state:
+    st.session_state.user = None
 if "model_cooldowns" not in st.session_state:
     st.session_state.model_cooldowns = {}
 
-if "user" not in st.session_state:
-    st.session_state.user = None
+MODEL_CASCADE = [
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite"
+]
+COOLDOWN_PERIOD_SECONDS = 60
 
 # ==========================================
-# 2. AUTHENTICATION HELPERS
+# 2. GEMINI FALLBACK PIPELINE
 # ==========================================
 
+def get_gemini_client() -> genai.Client:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        st.error("Missing GEMINI_API_KEY environment variable.")
+        st.stop()
+    return genai.Client(api_key=api_key)
 
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode(
-        "utf-8"
-    )
-
-
-def verify_password(password: str, hashed: str) -> bool:
-    return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
-
-
-def register_user(username: str, password: str) -> Tuple[bool, str]:
-    hashed = hash_password(password)
-    res = (
-        supabase.table("users")
-        .select("id")
-        .eq("username", username)
-        .execute()
-    )
-    if res.data:
-        return False, "Username already exists."
-
-    supabase.table("users").insert(
-        {"username": username, "password_hash": hashed}
-    ).execute()
-    return True, "Account created successfully! Please log in."
-
-
-def login_user(username: str, password: str) -> Tuple[bool, str]:
-    res = (
-        supabase.table("users")
-        .select("*")
-        .eq("username", username)
-        .execute()
-    )
-    if not res.data:
-        return False, "User not found."
-
-    user_data = res.data[0]
-    if verify_password(password, user_data["password_hash"]):
-        st.session_state.user = {
-            "id": user_data["id"],
-            "username": user_data["username"],
-        }
-        return True, "Logged in!"
-    return False, "Invalid password."
-
-
-# ==========================================
-# 3. DATABASE OPERATIONS
-# ==========================================
-
-
-def save_cards(user_id: str, cards: List[dict]):
-    today_str = datetime.date.today().isoformat()
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    records = []
-    for card in cards:
-        records.append(
-            {
-                "user_id": user_id,
-                "subject": card.get("subject", "General").strip(),
-                "question": card.get("question", ""),
-                "diagram": card.get("diagram", None),
-                "answer": card.get("answer", ""),
-                "last_reviewed": now_str,
-                "interval": 0,
-                "repetition": 0,
-                "efactor": 2.5,
-                "next_review": today_str,
-            }
-        )
-    if records:
-        supabase.table("flashcards").insert(records).execute()
-
-
-def get_cards_by_subject(user_id: str, subject: str = "All") -> List[dict]:
-    query = supabase.table("flashcards").select("*").eq("user_id", user_id)
-    if subject != "All":
-        query = query.eq("subject", subject)
-    res = query.execute()
-    return res.data or []
-
-
-def get_all_subjects(user_id: str) -> List[str]:
-    res = (
-        supabase.table("flashcards")
-        .select("subject")
-        .eq("user_id", user_id)
-        .execute()
-    )
-    if not res.data:
-        return []
-    return sorted(list({r["subject"] for r in res.data if r.get("subject")}))
-
-
-def update_card_review(
-    card_id: str, quality: int, current_rep: int, current_int: int, current_ef: float
-):
-    if quality >= 3:
-        if current_rep == 0:
-            new_int = 1
-        elif current_rep == 1:
-            new_int = 6
-        else:
-            new_int = math.ceil(current_int * current_ef)
-        rep = current_rep + 1
-    else:
-        rep = 0
-        new_int = 1
-
-    new_ef = current_ef + (
-        0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02)
-    )
-    if new_ef < 1.3:
-        new_ef = 1.3
-
-    next_date = (
-        datetime.date.today() + datetime.timedelta(days=new_int)
-    ).isoformat()
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    supabase.table("flashcards").update(
-        {
-            "last_reviewed": now_str,
-            "interval": new_int,
-            "repetition": rep,
-            "efactor": new_ef,
-            "next_review": next_date,
-        }
-    ).eq("id", card_id).execute()
-
-
-def delete_card(card_id: str):
-    supabase.table("flashcards").delete().eq("id", card_id).execute()
-
-
-# ==========================================
-# 4. SMART FALLBACK & GEMINI FUNCTIONS
-# ==========================================
-
-
-def extract_text_from_pdf(pdf_file) -> str:
-    try:
-        reader = pypdf.PdfReader(pdf_file)
-        extracted_text = []
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                extracted_text.append(text)
-        return "\n".join(extracted_text)
-    except Exception as e:
-        st.error(f"Error reading PDF file: {e}")
-        return ""
-
-
-def get_review_status(last_reviewed_str: Optional[str]) -> Tuple[str, bool]:
-    if not last_reviewed_str:
-        return "Needs Review", False
-    try:
-        last_date = datetime.datetime.strptime(
-            last_reviewed_str, "%Y-%m-%d %H:%M:%S"
-        ).date()
-        days_passed = (datetime.date.today() - last_date).days
-        return (
-            ("Up to Date", True) if days_passed <= 3 else ("Due for Review", False)
-        )
-    except ValueError:
-        return "Needs Review", False
-
-
-def is_model_available(model_name: str) -> bool:
-    """Checks whether a model is out of its demand cooldown period."""
-    cooldown_until = st.session_state.model_cooldowns.get(model_name, 0)
-    return time.time() > cooldown_until
-
-
-def mark_model_overloaded(model_name: str):
-    """Puts a model in cooldown mode to bypass it during high-demand windows."""
-    st.session_state.model_cooldowns[model_name] = (
-        time.time() + COOLDOWN_PERIOD_SECONDS
-    )
-
-
-def generate_content_smart_fallback(contents, config, status_container=None) -> str:
-    """Cascade router: Tries the first healthy model and fails over dynamically on demand errors."""
-    errors_encountered = []
+def call_gemini_with_fallback(prompt: str, response_schema=None, system_instruction: str = None) -> str:
+    client = get_gemini_client()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    
+    config = types.GenerateContentConfig()
+    if response_schema:
+        config.response_mime_type = "application/json"
+        config.response_schema = response_schema
+    if system_instruction:
+        config.system_instruction = system_instruction
 
     for model in MODEL_CASCADE:
-        # Skip models currently marked as overloaded/in cooldown
-        if not is_model_available(model):
+        cooldown_until = st.session_state.model_cooldowns.get(model)
+        if cooldown_until and now < cooldown_until:
             continue
 
         try:
-            if status_container:
-                status_container.write(f"🔄 Requesting via `{model}`...")
             response = client.models.generate_content(
                 model=model,
-                contents=contents,
-                config=config,
+                contents=prompt,
+                config=config
             )
             return response.text
-
-        except APIError as e:
-            err_code = getattr(e, "code", None)
-            if err_code in (429, 503):
-                mark_model_overloaded(model)
-                if status_container:
-                    status_container.write(
-                        f"⚠️ Model `{model}` hit heavy load (HTTP {err_code}). Retrying with fallback..."
-                    )
-                errors_encountered.append(f"{model}: {e}")
-                continue
-            # Re-raise non-demand errors immediately (e.g. invalid arguments)
-            raise e
         except Exception as e:
-            errors_encountered.append(f"{model}: {e}")
-            continue
+            error_msg = str(e).lower()
+            if "429" in error_msg or "503" in error_msg or "quota" in error_msg:
+                st.session_state.model_cooldowns[model] = now + datetime.timedelta(seconds=COOLDOWN_PERIOD_SECONDS)
+                st.warning(f"Model {model} busy/rate-limited. Falling back to next available model...")
+                continue
+            else:
+                st.error(f"Error calling {model}: {e}")
+                raise e
 
-    raise RuntimeError(
-        "All models in the cascade are currently experiencing high demand or errors. "
-        f"Details: {'; '.join(errors_encountered)}"
-    )
+    raise Exception("All Gemini models in the fallback pipeline are currently unavailable or rate-limited.")
 
+# ==========================================
+# 3. FORGETTING CURVE & SM-2 LOGIC
+# ==========================================
 
-def generate_cards_with_gemini(
-    contents_input, num_cards: int = 5, existing_subjects: Optional[List[str]] = None, status_container=None
-) -> dict:
-    if not existing_subjects:
-        existing_subjects = ["General"]
-    existing_str = ", ".join(f'"{s}"' for s in existing_subjects)
-
-    system_prompt = f"""
-    Analyze the provided content and generate {num_cards} flashcards.
-
-    CATEGORIZATION & FORMATTING RULES:
-    1. Prefer choosing a subject from this existing list if it fits well: [{existing_str}].
-    2. If NONE fit, create a NEW concise subject name (1-3 words).
-    3. MATHEMATICS & FORMULAS: Format all equations using LaTeX ($x^2$ or $$\\int x$$).
-    4. DIAGRAMS: Generate ASCII art in "diagram" if useful, otherwise null.
+def calculate_forgetting_curve(last_reviewed: str, interval: int) -> tuple[float, str, str]:
     """
+    Calculates retention percentage (R) using Ebbinghaus Forgetting Curve: R = e^(-t / S)
+    where t is elapsed time in days, and S is memory stability (interval in days).
+    """
+    if not last_reviewed:
+        return 0.0, "🔴 High Memory Decay (Needs Review)", "#FF4B4B"
 
-    card_schema = types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "subject": types.Schema(type=types.Type.STRING),
-            "question": types.Schema(type=types.Type.STRING),
-            "diagram": types.Schema(type=types.Type.STRING, nullable=True),
-            "answer": types.Schema(type=types.Type.STRING),
-        },
-        required=["subject", "question", "answer"],
-    )
+    # Handle timezone formatting
+    last_dt = datetime.datetime.fromisoformat(last_reviewed.replace("Z", "+00:00"))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    
+    elapsed_days = max((now - last_dt).total_seconds() / 86400.0, 0.001)
+    stability = max(interval, 1)
 
-    response_schema = types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "cards": types.Schema(
-                type=types.Type.ARRAY, items=card_schema
-            )
-        },
-        required=["cards"],
-    )
+    # Retention formula: R = e^(-t / S)
+    retention = math.exp(-elapsed_days / stability) * 100
+    retention_pct = round(retention, 1)
 
-    contents = []
-    if isinstance(contents_input, Image.Image):
-        contents.append(contents_input)
-        contents.append(f"Generate {num_cards} flashcards from this image.")
+    if retention_pct >= 80:
+        status = "🟢 Strong Memory"
+        color = "#00C853"
+    elif retention_pct >= 50:
+        status = "🟡 Medium Decay"
+        color = "#FFD600"
     else:
-        contents.append(f"Content:\n{contents_input[:4000]}")
+        status = "🔴 High Decay (Review Recommended)"
+        color = "#FF4B4B"
 
-    config = types.GenerateContentConfig(
-        system_instruction=system_prompt,
-        response_mime_type="application/json",
-        response_schema=response_schema,
-    )
+    return retention_pct, status, color
 
-    try:
-        response_text = generate_content_smart_fallback(contents, config, status_container)
-        data = json.loads(response_text)
-        return {"success": True, "cards": data.get("cards", [])}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+def update_card_review(card_id: str, quality: int, current_interval: int, current_ef: float, current_repetition: int):
+    """Updates card memory parameters using SuperMemo-2 (SM-2)."""
+    quality = max(0, min(5, quality))
+    new_ef = current_ef + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
+    new_ef = max(1.3, new_ef)
 
+    if quality >= 3:
+        if current_repetition == 0:
+            new_interval = 1
+        elif current_repetition == 1:
+            new_interval = 6
+        else:
+            new_interval = round(current_interval * new_ef)
+        new_repetition = current_repetition + 1
+    else:
+        new_repetition = 0
+        new_interval = 1
 
-def evaluate_answer(user_ans: str, correct_ans: str, question: str) -> dict:
-    eval_prompt = f"""
-    Question: {question}
-    Correct Answer: {correct_ans}
-    User Answer: {user_ans}
-    """
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    next_review = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=new_interval)).isoformat()
 
-    eval_schema = types.Schema(
-        type=types.Type.OBJECT,
-        properties={
-            "is_correct": types.Schema(type=types.Type.BOOLEAN),
-            "quality": types.Schema(type=types.Type.INTEGER),
-            "feedback": types.Schema(type=types.Type.STRING),
-        },
-        required=["is_correct", "quality", "feedback"],
-    )
-
-    config = types.GenerateContentConfig(
-        system_instruction="You evaluate flashcard quiz responses. Assess accuracy, rate quality between 0 and 5, and provide brief feedback.",
-        response_mime_type="application/json",
-        response_schema=eval_schema,
-    )
-
-    try:
-        response_text = generate_content_smart_fallback(eval_prompt, config)
-        return json.loads(response_text)
-    except Exception:
-        return {
-            "is_correct": False,
-            "quality": 1,
-            "feedback": "Evaluation failed due to temporary AI service overload.",
-        }
-
+    supabase.table("flashcards").update({
+        "interval": new_interval,
+        "easiness_factor": new_ef,
+        "repetition": new_repetition,
+        "last_reviewed": now_iso,
+        "next_review": next_review
+    }).eq("id", card_id).execute()
 
 # ==========================================
-# 5. AUTHENTICATION UI
+# 4. AUTHENTICATION & USER MANAGEMENT
 # ==========================================
 
+def login_user(username, password):
+    res = supabase.table("users").select("*").eq("username", username).execute()
+    if res.data:
+        user = res.data[0]
+        if bcrypt.checkpw(password.encode("utf-8"), user["password_hash"].encode("utf-8")):
+            st.session_state.user = user
+            st.rerun()
+        else:
+            st.error("Invalid password.")
+    else:
+        st.error("User not found.")
+
+def register_user(username, password):
+    res = supabase.table("users").select("*").eq("username", username).execute()
+    if res.data:
+        st.error("Username already taken.")
+        return
+
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    new_user = supabase.table("users").insert({"username": username, "password_hash": hashed}).execute()
+    if new_user.data:
+        st.success("Account created successfully! Please log in.")
+
+# Auth Screen
 if not st.session_state.user:
-    st.title("🧠 AI Flashcard Hub")
-    auth_tab1, auth_tab2 = st.tabs(["🔐 Login", "📝 Register"])
-
+    st.title("🧠 Multi-User AI Flashcard Hub")
+    auth_tab1, auth_tab2 = st.tabs(["Login", "Register"])
+    
     with auth_tab1:
-        with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            if st.form_submit_button("Login", type="primary"):
-                success, msg = login_user(username, password)
-                if success:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
+        u = st.text_input("Username", key="login_u")
+        p = st.text_input("Password", type="password", key="login_p")
+        if st.button("Log In"):
+            login_user(u, p)
+            
     with auth_tab2:
-        with st.form("register_form"):
-            new_user = st.text_input("New Username")
-            new_pass = st.text_input("New Password", type="password")
-            if st.form_submit_button("Create Account"):
-                if new_user and new_pass:
-                    success, msg = register_user(new_user, new_pass)
-                    if success:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
-                else:
-                    st.warning("Please fill in all fields.")
+        u_reg = st.text_input("Username", key="reg_u")
+        p_reg = st.text_input("Password", type="password", key="reg_p")
+        if st.button("Register Account"):
+            register_user(u_reg, p_reg)
+            
     st.stop()
 
-# ==========================================
-# 6. LOGGED-IN APP UI
-# ==========================================
-
-user = st.session_state.user
-st.sidebar.write(f"Logged in as: **{user['username']}**")
-
-# Display system health indicator in the sidebar
-st.sidebar.divider()
-st.sidebar.caption("🤖 Model Status")
-for m in MODEL_CASCADE:
-    status = "🟢 Ready" if is_model_available(m) else "🔴 Heavy Load (Cooldown)"
-    st.sidebar.text(f"{m}: {status}")
-
-if st.sidebar.button("Logout"):
+# Logout in sidebar
+st.sidebar.write(f"Logged in as: **{st.session_state.user['username']}**")
+if st.sidebar.button("Log Out"):
     st.session_state.user = None
     st.rerun()
 
-st.title("🧠 AI Flashcard Hub")
-tab1, tab2, tab3 = st.tabs(
-    ["⚡ Generate Cards", "🎴 Smart Quiz", "📚 Dashboard"]
-)
+# ==========================================
+# 5. MAIN APPLICATION TABS
+# ==========================================
 
-# TAB 1: GENERATE
+tab1, tab2, tab3 = st.tabs(["⚡ Generate Cards", "🎴 Smart Quiz", "📚 Dashboard & Retention"])
+
+# ------------------------------------------
+# TAB 1: GENERATE FLASHCARDS
+# ------------------------------------------
 with tab1:
-    st.subheader("Generate New Flashcards")
-    uploaded_file = st.file_uploader(
-        "Upload (.txt, .pdf, .png, .jpg)", type=["txt", "pdf", "png", "jpg", "jpeg"]
-    )
-    text_input = st.text_area("Or paste notes:", height=150)
-    card_count = st.number_input(
-        "Card count", min_value=1, max_value=20, value=5
-    )
+    st.header("Generate AI Flashcards")
+    subject = st.text_input("Subject / Topic", placeholder="e.g., Organic Chemistry, US History")
+    input_text = st.text_area("Source Material or Notes", height=150)
+    uploaded_file = st.file_uploader("Or Upload Document/Image", type=["txt", "pdf", "png", "jpg"])
 
-    if st.button("Generate Flashcards", type="primary"):
-        payload = None
-        if uploaded_file:
-            ext = uploaded_file.name.split(".")[-1].lower()
-            if ext == "txt":
-                payload = uploaded_file.read().decode("utf-8")
-            elif ext == "pdf":
-                payload = extract_text_from_pdf(uploaded_file)
-            elif ext in ["png", "jpg", "jpeg"]:
-                payload = Image.open(uploaded_file)
-        elif text_input.strip():
-            payload = text_input.strip()
-
-        if payload:
-            status = st.status("Initializing AI flashcard generation...", expanded=True)
-            existing = get_all_subjects(user["id"])
-            res = generate_cards_with_gemini(
-                payload, card_count, existing, status_container=status
-            )
+    if st.button("Generate Cards"):
+        content_payload = []
+        if input_text:
+            content_payload.append(input_text)
             
-            if res["success"]:
-                status.write("💾 Saving flashcards to database...")
-                save_cards(user["id"], res["cards"])
-                status.update(
-                    label=f"✅ Finished! Generated and saved {len(res['cards'])} flashcards.",
-                    state="complete",
-                    expanded=False
-                )
-                time.sleep(1)
-                st.rerun()
+        if uploaded_file:
+            bytes_data = uploaded_file.read()
+            if uploaded_file.type == "text/plain":
+                content_payload.append(bytes_data.decode("utf-8"))
             else:
-                status.update(
-                    label="❌ Generation failed.",
-                    state="error",
-                    expanded=True
+                content_payload.append(
+                    types.Part.from_bytes(data=bytes_data, mime_type=uploaded_file.type)
                 )
-                st.error(res["error"])
+
+        if not content_payload:
+            st.warning("Please provide notes or upload a file.")
         else:
-            st.warning("Please upload a file or paste text content first.")
+            with st.spinner("Analyzing content and building flashcards..."):
+                schema = types.Schema(
+                    type=types.Type.ARRAY,
+                    items=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "question": types.Schema(type=types.Type.STRING),
+                            "answer": types.Schema(type=types.Type.STRING)
+                        },
+                        required=["question", "answer"]
+                    )
+                )
+                
+                prompt = f"Create key study flashcards for subject '{subject}'. Extract key concepts into question and answer pairs."
+                
+                try:
+                    raw_json = call_gemini_with_fallback(
+                        prompt=[prompt] + content_payload,
+                        response_schema=schema,
+                        system_instruction="You are an expert tutor creating concise, accurate flashcards."
+                    )
+                    
+                    cards = json.loads(raw_json)
+                    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    
+                    db_cards = []
+                    for c in cards:
+                        db_cards.append({
+                            "user_id": st.session_state.user["id"],
+                            "subject": subject or "General",
+                            "question": c["question"],
+                            "answer": c["answer"],
+                            "interval": 1,
+                            "easiness_factor": 2.5,
+                            "repetition": 0,
+                            "last_reviewed": now_iso,
+                            "next_review": now_iso
+                        })
+                        
+                    supabase.table("flashcards").insert(db_cards).execute()
+                    st.success(f"Generated and saved {len(cards)} flashcards!")
+                except Exception as e:
+                    st.error(f"Failed to generate flashcards: {e}")
 
-# TAB 2: QUIZ
+# ------------------------------------------
+# TAB 2: SMART QUIZ (WITH RETENTION)
+# ------------------------------------------
 with tab2:
-    st.subheader("Smart Spaced-Repetition Quiz")
-    subjects = get_all_subjects(user["id"])
-    if not subjects:
-        st.info("No cards found. Generate cards to get started!")
+    st.header("Smart Quiz & Self-Evaluation")
+    
+    # Fetch cards for review
+    res = supabase.table("flashcards").select("*").eq("user_id", st.session_state.user["id"]).execute()
+    cards = res.data or []
+
+    if not cards:
+        st.info("No flashcards found. Create some in the 'Generate Cards' tab!")
     else:
-        sel_sub = st.selectbox("Select Subject", options=["All"] + subjects)
+        # Sort by lowest retention first (most urgently needing review)
+        cards_with_retention = []
+        for c in cards:
+            ret, status, color = calculate_forgetting_curve(c.get("last_reviewed"), c.get("interval", 1))
+            cards_with_retention.append((ret, c, status, color))
+            
+        cards_with_retention.sort(key=lambda x: x[0]) # Lowest retention first
+        
+        selected_card_tuple = cards_with_retention[0]
+        retention, card, status, color = selected_card_tuple
+        
+        st.subheader(f"Subject: {card['subject']}")
+        
+        # Display Forgetting Curve Metric
+        col_q, col_m = st.columns([3, 1])
+        with col_m:
+            st.metric("Estimated Memory Retention", f"{retention}%")
+            st.markdown(f"<span style='color:{color}; font-weight:bold;'>{status}</span>", unsafe_allow_html=True)
 
-        if "quiz_cards" not in st.session_state or st.button(
-            "Start Review Session"
-        ):
-            st.session_state.quiz_cards = get_cards_by_subject(
-                user["id"], sel_sub
-            )
-            st.session_state.q_idx = 0
-            st.session_state.show_ans = False
-            st.session_state.eval = None
+        with col_q:
+            st.markdown(f"### Q:")
 
-        cards = st.session_state.get("quiz_cards", [])
-        if cards:
-            idx = st.session_state.q_idx
-            card = cards[idx]
-            status_label, _ = get_review_status(card["last_reviewed"])
+        user_answer = st.text_area("Your Answer:", key=f"ans_{card['id']}")
+        
+        if st.button("Evaluate Answer"):
+            if not user_answer:
+                st.warning("Please enter an answer first.")
+            else:
+                with st.spinner("AI evaluating your response..."):
+                    eval_schema = types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "score": types.Schema(type=types.Type.INTEGER, description="Grade from 0 (completely wrong) to 5 (perfect execution)"),
+                            "feedback": types.Schema(type=types.Type.STRING, description="Constructive feedback explaining the grade")
+                        },
+                        required=["score", "feedback"]
+                    )
+                    
+                    eval_prompt = f"Correct Answer: {card['answer']}\nUser Answer: {user_answer}\nEvaluate accuracy and grade 0-5."
+                    
+                    eval_res = call_gemini_with_fallback(
+                        prompt=eval_prompt,
+                        response_schema=eval_schema,
+                        system_instruction="You are an encouraging tutor grading student flashcard answers."
+                    )
+                    
+                    eval_data = json.loads(eval_res)
+                    score = eval_data["score"]
+                    feedback = eval_data["feedback"]
 
-            st.caption(
-                f"Card {idx + 1} of {len(cards)} | Subject: {card['subject']} | Status: {status_label}"
-            )
-            with st.container(border=True):
-                st.markdown("### Q:")
-                st.markdown(card["question"])
-                if card.get("diagram"):
-                    st.code(card["diagram"], language="text")
+                    st.markdown(f"**AI Grade:** {score}/5")
+                    st.markdown(f"**Feedback:** {feedback}")
+                    st.markdown(f"Actual Answer:")
 
-                user_ans = st.text_input("Your Answer:", key=f"ans_{idx}")
-                if st.button("Submit Answer", type="primary", key=f"sub_{idx}"):
-                    with st.spinner("Evaluating answer..."):
-                        eval_res = evaluate_answer(
-                            user_ans, card["answer"], card["question"]
-                        )
-                        st.session_state.eval = eval_res
-                        st.session_state.show_ans = True
-                        update_card_review(
-                            card["id"],
-                            eval_res.get("quality", 3),
-                            card["repetition"],
-                            card["interval"],
-                            card["efactor"],
-                        )
+                    # Update database with SM-2 algorithm
+                    update_card_review(
+                        card["id"],
+                        score,
+                        card.get("interval", 1),
+                        card.get("easiness_factor", 2.5),
+                        card.get("repetition", 0)
+                    )
+                    st.success("Card updated using Spaced Repetition + Forgetting Curve algorithm!")
 
-                if st.session_state.get("eval"):
-                    res = st.session_state.eval
-                    st.divider()
-                    if res.get("is_correct"):
-                        st.success(f"Feedback: {res.get('feedback', '')}")
-                    else:
-                        st.error(f"Feedback: {res.get('feedback', '')}")
-
-                if st.session_state.get("show_ans"):
-                    st.markdown("**Expected Answer:**")
-                    st.markdown(card["answer"])
-
-            c1, c2, c3 = st.columns([1, 2, 1])
-            with c1:
-                if st.button("⬅️ Previous", disabled=(idx == 0)):
-                    st.session_state.q_idx -= 1
-                    st.session_state.show_ans = False
-                    st.session_state.eval = None
-                    st.rerun()
-            with c3:
-                if st.button("Next ➡️", disabled=(idx >= len(cards) - 1)):
-                    st.session_state.q_idx += 1
-                    st.session_state.show_ans = False
-                    st.session_state.eval = None
-                    st.rerun()
-
-# TAB 3: DASHBOARD
+# ------------------------------------------
+# TAB 3: DASHBOARD & FORGETTING CURVE STATUS
+# ------------------------------------------
 with tab3:
-    st.subheader("📚 Saved Flashcards Dashboard")
-    subjects = get_all_subjects(user["id"])
-    filter_sub = st.selectbox(
-        "Filter Subject", options=["All"] + subjects, key="dash_sub"
-    )
-    all_data = get_cards_by_subject(user["id"], filter_sub)
-
-    if not all_data:
-        st.info("No saved cards.")
+    st.header("Deck Management & Retention Tracking")
+    
+    res = supabase.table("flashcards").select("*").eq("user_id", st.session_state.user["id"]).execute()
+    cards = res.data or []
+    
+    if not cards:
+        st.info("No saved flashcards.")
     else:
-        for c in all_data:
-            with st.container(border=True):
-                r1, r2, r3, r4 = st.columns([1.5, 3, 3, 0.8])
-                r1.markdown(f"**{c['subject']}**")
-                r2.markdown(c["question"])
-                r3.markdown(c["answer"])
-                if r4.button("🗑️", key=f"del_{c['id']}"):
-                    delete_card(c["id"])
-                    st.rerun()
+        table_data = []
+        for c in cards:
+            ret, status, _ = calculate_forgetting_curve(c.get("last_reviewed"), c.get("interval", 1))
+            table_data.append({
+                "ID": c["id"],
+                "Subject": c["subject"],
+                "Question": c["question"],
+                "Retention %": f"{ret}%",
+                "Status": status,
+                "Interval (Days)": c.get("interval", 1),
+                "Last Reviewed": c.get("last_reviewed", "Never")[:10]
+            })
+
+        df = pd.DataFrame(table_data)
+        
+        # Summary metrics
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Cards", len(cards))
+        avg_retention = round(sum([float(x["Retention %"].replace("%", "")) for x in table_data]) / len(cards), 1)
+        m2.metric("Average Deck Retention", f"{avg_retention}%")
+        critical_cards = len([x for x in table_data if "High Decay" in x["Status"]])
+        m3.metric("Cards Needing Review", critical_cards)
+
+        st.markdown("### Flashcard Inventory")
+        st.dataframe(df.drop(columns=["ID"]), use_container_width=True)
+
+        # Individual Card Deletion
+        st.markdown("### Manage Cards")
+        delete_id = st.selectbox("Select Card to Delete", options=[c["ID"] for c in table_data], format_func=lambda x: next(item["Question"] for item in table_data if item["ID"] == x))
+        if st.button("Delete Selected Card"):
+            supabase.table("flashcards").delete().eq("id", delete_id).execute()
+            st.success("Card deleted successfully!")
+            st.rerun()

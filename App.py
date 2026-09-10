@@ -137,31 +137,43 @@ def calculate_forgetting_curve(last_reviewed: str, interval: int) -> tuple[float
 def update_card_review(card_id: str, quality: int, current_interval: int, current_ef: float, current_repetition: int):
     """Updates card memory parameters using SuperMemo-2 (SM-2)."""
     quality = max(0, min(5, quality))
-    new_ef = current_ef + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
+    
+    # Ensure current_ef and current_interval have valid fallbacks
+    ef = float(current_ef) if current_ef is not None else 2.5
+    interval = int(current_interval) if current_interval is not None else 1
+    repetition = int(current_repetition) if current_repetition is not None else 0
+
+    new_ef = ef + (0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
     new_ef = max(1.3, new_ef)
 
     if quality >= 3:
-        if current_repetition == 0:
+        if repetition == 0:
             new_interval = 1
-        elif current_repetition == 1:
+        elif repetition == 1:
             new_interval = 6
         else:
-            new_interval = round(current_interval * new_ef)
-        new_repetition = current_repetition + 1
+            new_interval = round(interval * new_ef)
+        new_repetition = repetition + 1
     else:
         new_repetition = 0
         new_interval = 1
 
-    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    next_review = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=new_interval)).isoformat()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    now_iso = now.isoformat()
+    next_review_iso = (now + datetime.timedelta(days=int(new_interval))).isoformat()
 
-    supabase.table("flashcards").update({
-        "interval": new_interval,
-        "easiness_factor": new_ef,
-        "repetition": new_repetition,
+    payload = {
+        "interval": int(new_interval),
+        "easiness_factor": float(round(new_ef, 2)),
+        "repetition": int(new_repetition),
         "last_reviewed": now_iso,
-        "next_review": next_review
-    }).eq("id", card_id).execute()
+        "next_review": next_review_iso
+    }
+
+    try:
+        supabase.table("flashcards").update(payload).eq("id", card_id).execute()
+    except Exception as e:
+        st.error(f"Failed to update review status in database: {e}")
 
 # ==========================================
 # 4. AUTHENTICATION & USER MANAGEMENT

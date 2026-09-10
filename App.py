@@ -54,7 +54,7 @@ def get_gemini_client() -> genai.Client:
         st.stop()
     return genai.Client(api_key=api_key)
 
-def call_gemini_with_fallback(prompt: str, response_schema=None, system_instruction: str = None) -> str:
+def call_gemini_with_fallback(prompt, response_schema=None, system_instruction: str = None) -> str:
     client = get_gemini_client()
     now = datetime.datetime.now(datetime.timezone.utc)
     
@@ -84,8 +84,10 @@ def call_gemini_with_fallback(prompt: str, response_schema=None, system_instruct
                 st.warning(f"Model {model} busy/rate-limited. Falling back to next available model...")
                 continue
             else:
-                st.error("All Gemini models are currently unavailable or rate-limited. Please wait a moment and try again.")
-                return None
+                break
+
+    st.error("All Gemini models are currently unavailable or rate-limited. Please wait a moment and try again.")
+    return None
 
 # ==========================================
 # 3. FORGETTING CURVE & SM-2 LOGIC
@@ -286,25 +288,26 @@ with tab1:
                         system_instruction="You are an expert tutor creating concise, accurate flashcards."
                     )
                     
-                    cards = json.loads(raw_json)
-                    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    
-                    db_cards = []
-                    for c in cards:
-                        db_cards.append({
-                            "user_id": st.session_state.user["id"],
-                            "subject": subject or "General",
-                            "question": c["question"],
-                            "answer": c["answer"],
-                            "interval": 1,
-                            "easiness_factor": 2.5,
-                            "repetition": 0,
-                            "last_reviewed": now_iso,
-                            "next_review": now_iso
-                        })
+                    if raw_json:
+                        cards = json.loads(raw_json)
+                        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
                         
-                    supabase.table("flashcards").insert(db_cards).execute()
-                    st.success(f"Generated and saved {len(cards)} flashcards!")
+                        db_cards = []
+                        for c in cards:
+                            db_cards.append({
+                                "user_id": st.session_state.user["id"],
+                                "subject": subject or "General",
+                                "question": c["question"],
+                                "answer": c["answer"],
+                                "interval": 1,
+                                "easiness_factor": 2.5,
+                                "repetition": 0,
+                                "last_reviewed": now_iso,
+                                "next_review": now_iso
+                            })
+                            
+                        supabase.table("flashcards").insert(db_cards).execute()
+                        st.success(f"Generated and saved {len(cards)} flashcards!")
                 except Exception as e:
                     st.error(f"Failed to generate flashcards: {e}")
 
@@ -341,7 +344,8 @@ with tab2:
             st.markdown(f"<span style='color:{color}; font-weight:bold;'>{status}</span>", unsafe_allow_html=True)
 
         with col_q:
-            st.markdown(f"### Q:")
+            # FIX: Properly display the card question
+            st.markdown(f"### Q: {card['question']}")
 
         user_answer = st.text_area("Your Answer:", key=f"ans_{card['id']}")
         
@@ -362,31 +366,29 @@ with tab2:
                     eval_prompt = f"Correct Answer: {card['answer']}\nUser Answer: {user_answer}\nEvaluate accuracy and grade 0-5."
                     
                     eval_res = call_gemini_with_fallback(
-                    prompt=eval_prompt,
-                    response_schema=eval_schema,
-                    system_instruction="You are an encouraging tutor grading student flashcard answers."
+                        prompt=eval_prompt,
+                        response_schema=eval_schema,
+                        system_instruction="You are an encouraging tutor grading student flashcard answers."
                     )
 
                     if eval_res:
-                        # Proceed with grading logic...
-                        pass
-                    eval_data = json.loads(eval_res)
-                    score = eval_data["score"]
-                    feedback = eval_data["feedback"]
+                        eval_data = json.loads(eval_res)
+                        score = eval_data["score"]
+                        feedback = eval_data["feedback"]
 
-                    st.markdown(f"**AI Grade:** {score}/5")
-                    st.markdown(f"**Feedback:** {feedback}")
-                    st.markdown(f"Actual Answer:")
+                        st.markdown(f"**AI Grade:** {score}/5")
+                        st.markdown(f"**Feedback:** {feedback}")
+                        st.markdown(f"Actual Answer:")
 
-                    # Update database with SM-2 algorithm
-                    update_card_review(
-                        card["id"],
-                        score,
-                        card.get("interval", 1),
-                        card.get("easiness_factor", 2.5),
-                        card.get("repetition", 0)
-                    )
-                    st.success("Card updated using Spaced Repetition + Forgetting Curve algorithm!")
+                        # Update database with SM-2 algorithm
+                        update_card_review(
+                            card["id"],
+                            score,
+                            card.get("interval", 1),
+                            card.get("easiness_factor", 2.5),
+                            card.get("repetition", 0)
+                        )
+                        st.success("Card updated using Spaced Repetition + Forgetting Curve algorithm!")
 
 # ------------------------------------------
 # TAB 3: DASHBOARD & FORGETTING CURVE STATUS

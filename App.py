@@ -84,10 +84,8 @@ def call_gemini_with_fallback(prompt: str, response_schema=None, system_instruct
                 st.warning(f"Model {model} busy/rate-limited. Falling back to next available model...")
                 continue
             else:
-                st.error(f"Error calling {model}: {e}")
-                raise e
-
-    raise Exception("All Gemini models in the fallback pipeline are currently unavailable or rate-limited.")
+                st.error("All Gemini models are currently unavailable or rate-limited. Please wait a moment and try again.")
+                return None
 
 # ==========================================
 # 3. FORGETTING CURVE & SM-2 LOGIC
@@ -364,11 +362,14 @@ with tab2:
                     eval_prompt = f"Correct Answer: {card['answer']}\nUser Answer: {user_answer}\nEvaluate accuracy and grade 0-5."
                     
                     eval_res = call_gemini_with_fallback(
-                        prompt=eval_prompt,
-                        response_schema=eval_schema,
-                        system_instruction="You are an encouraging tutor grading student flashcard answers."
+                    prompt=eval_prompt,
+                    response_schema=eval_schema,
+                    system_instruction="You are an encouraging tutor grading student flashcard answers."
                     )
-                    
+
+                    if eval_res:
+                        # Proceed with grading logic...
+                        pass
                     eval_data = json.loads(eval_res)
                     score = eval_data["score"]
                     feedback = eval_data["feedback"]

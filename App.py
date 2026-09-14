@@ -241,15 +241,17 @@ if st.sidebar.button("Log Out"):
 tab1, tab2, tab3 = st.tabs(["⚡ Generate Cards", "🎴 Smart Quiz", "📚 Dashboard & Retention"])
 
 # ------------------------------------------
-# TAB 1: GENERATE FLASHCARDS
+# TAB 1: GENERATE & VIEW FLASHCARDS
 # ------------------------------------------
 with tab1:
-    st.header("Generate AI Flashcards")
-    subject = st.text_input("Subject / Topic", placeholder="e.g., Organic Chemistry, US History")
+    st.header("⚡ Generate & View Flashcards")
+    
+    # 1. Generation Form
+    subject = st.text_input("Subject / Topic", placeholder="e.g., Organic Chemistry, Cybersecurity")
     input_text = st.text_area("Source Material or Notes", height=150)
     uploaded_file = st.file_uploader("Or Upload Document/Image", type=["txt", "pdf", "png", "jpg"])
 
-    if st.button("Generate Cards"):
+    if st.button("Generate Cards", type="primary"):
         content_payload = []
         if input_text:
             content_payload.append(input_text)
@@ -308,83 +310,70 @@ with tab1:
                             
                         supabase.table("flashcards").insert(db_cards).execute()
                         st.success(f"Generated and saved {len(cards)} flashcards!")
+                        st.rerun()
                 except Exception as e:
                     st.error(f"Failed to generate flashcards: {e}")
 
+    st.divider()
+
+    # 2. Flashcard Inventory Table in Tab 1
+    st.subheader("📋 Flashcard Inventory")
+    res = supabase.table("flashcards").select("*").eq("user_id", st.session_state.user["id"]).execute()
+    cards = res.data or []
+
+    if not cards:
+        st.info("No flashcards found. Use the generator above to create your first deck!")
+    else:
+        table_rows = []
+        for c in cards:
+            ret, status, _ = calculate_forgetting_curve(c.get("last_reviewed"), c.get("interval", 1))
+            table_rows.append({
+                "Subject": c.get("subject", "General"),
+                "Question": c.get("question", ""),
+                "Answer": c.get("answer", ""),
+                "Retention": f"{ret}%",
+                "Status": status
+            })
+
+        inventory_df = pd.DataFrame(table_rows)
+
+        st.dataframe(
+            inventory_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Subject": st.column_config.TextColumn("Subject", width="medium"),
+                "Question": st.column_config.TextColumn("Question", width="large"),
+                "Answer": st.column_config.TextColumn("Answer", width="large"),
+                "Retention": st.column_config.TextColumn("Retention", width="small"),
+                "Status": st.column_config.TextColumn("Status", width="medium"),
+            }
+        )
+
 # ------------------------------------------
-# TAB 2: SMART QUIZ (WITH RETENTION)
+# TAB 2: SMART QUIZ (CLEANED UP & STREAMLINED)
 # ------------------------------------------
 with tab2:
     st.header("🎴 Smart Quiz & Self-Evaluation")
     
-    # Fetch user's flashcards
     res = supabase.table("flashcards").select("*").eq("user_id", st.session_state.user["id"]).execute()
     cards = res.data or []
 
     if not cards:
         st.info("No flashcards found. Create some in the 'Generate Cards' tab!")
     else:
-        # Sort by lowest retention first (most urgently needing review)
         cards_with_retention = []
         for c in cards:
             ret, status, color = calculate_forgetting_curve(c.get("last_reviewed"), c.get("interval", 1))
-            cards_with_retention.append({
-                "retention": ret,
-                "card": c,
-                "status": status,
-                "color": color
-            })
+            cards_with_retention.append((ret, c, status, color))
             
-        cards_with_retention.sort(key=lambda x: x["retention"])  # Lowest retention first
+        cards_with_retention.sort(key=lambda x: x[0])  # Lowest retention first
 
-        # Maintain session index to allow cycling through cards
         if "card_index" not in st.session_state or st.session_state.card_index >= len(cards_with_retention):
             st.session_state.card_index = 0
 
-        # --- 1. NEAT REVIEW QUEUE TABLE ---
-        st.subheader("📋 Study Queue Overview")
-        
-        table_rows = []
-        for idx, item in enumerate(cards_with_retention):
-            c = item["card"]
-            # Highlight active card in the table
-            prefix = "▶ " if idx == st.session_state.card_index else ""
-            table_rows.append({
-                "Current": f"{prefix}Card {idx + 1}",
-                "Subject": c.get("subject", "General"),
-                "Question": c.get("question", ""),
-                "Answer": c.get("answer", ""),
-                "Memory Retention": f"{item['retention']}%",
-                "Review Status": item["status"]
-            })
-            
-        queue_df = pd.DataFrame(table_rows)
-        
-        # Display neat interactive table
-        st.dataframe(
-            queue_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Current": st.column_config.TextColumn("Active", width="small"),
-                "Subject": st.column_config.TextColumn("Subject", width="medium"),
-                "Question": st.column_config.TextColumn("Question", width="large"),
-                "Answer": st.column_config.TextColumn("Answer", width="large"),
-                "Memory Retention": st.column_config.TextColumn("Retention", width="small"),
-                "Review Status": st.column_config.TextColumn("Status", width="medium"),
-            }
-        )
+        retention, card, status, color = cards_with_retention[st.session_state.card_index]
 
-        st.divider()
-
-        # --- 2. ACTIVE CARD REVIEW INTERFACE ---
-        active_item = cards_with_retention[st.session_state.card_index]
-        card = active_item["card"]
-        retention = active_item["retention"]
-        status = active_item["status"]
-        color = active_item["color"]
-
-        # Card Header & Controls
         col_header, col_nav = st.columns([3, 1])
         with col_header:
             st.caption(f"Currently Reviewing: Card {st.session_state.card_index + 1} of {len(cards_with_retention)}")
@@ -394,7 +383,8 @@ with tab2:
                 st.session_state.card_index = (st.session_state.card_index + 1) % len(cards_with_retention)
                 st.rerun()
 
-        # Active Question & Metric
+        st.divider()
+
         col_q, col_m = st.columns([3, 1])
         with col_q:
             st.markdown(f"### Q: {card['question']}")
@@ -404,7 +394,6 @@ with tab2:
 
         st.divider()
 
-        # User Answer Input
         user_answer = st.text_area("Your Answer:", key=f"ans_{card['id']}", height=120)
 
         col_btn1, col_btn2 = st.columns([1, 1])
@@ -413,11 +402,9 @@ with tab2:
         with col_btn2:
             show_answer = st.button("👁️ Reveal Correct Answer", use_container_width=True)
 
-        # Direct Answer Reveal
         if show_answer:
             st.info(f"Correct Answer:")
 
-        # AI Evaluation Flow
         if eval_clicked:
             if not user_answer.strip():
                 st.warning("Please type an answer before requesting AI feedback.")
@@ -456,7 +443,6 @@ with tab2:
                         st.write(f"**Feedback:** {feedback}")
                         st.info(f"Expected Answer:")
 
-                        # Update Spaced Repetition Parameters in Supabase
                         update_card_review(
                             card["id"],
                             score,

@@ -315,9 +315,9 @@ with tab1:
 # TAB 2: SMART QUIZ (WITH RETENTION)
 # ------------------------------------------
 with tab2:
-    st.header("Smart Quiz & Self-Evaluation")
+    st.header("🎴 Smart Quiz & Self-Evaluation")
     
-    # Fetch cards for review
+    # Fetch user's flashcards
     res = supabase.table("flashcards").select("*").eq("user_id", st.session_state.user["id"]).execute()
     cards = res.data or []
 
@@ -328,30 +328,99 @@ with tab2:
         cards_with_retention = []
         for c in cards:
             ret, status, color = calculate_forgetting_curve(c.get("last_reviewed"), c.get("interval", 1))
-            cards_with_retention.append((ret, c, status, color))
+            cards_with_retention.append({
+                "retention": ret,
+                "card": c,
+                "status": status,
+                "color": color
+            })
             
-        cards_with_retention.sort(key=lambda x: x[0]) # Lowest retention first
+        cards_with_retention.sort(key=lambda x: x["retention"])  # Lowest retention first
+
+        # Maintain session index to allow cycling through cards
+        if "card_index" not in st.session_state or st.session_state.card_index >= len(cards_with_retention):
+            st.session_state.card_index = 0
+
+        # --- 1. NEAT REVIEW QUEUE TABLE ---
+        st.subheader("📋 Study Queue Overview")
         
-        selected_card_tuple = cards_with_retention[0]
-        retention, card, status, color = selected_card_tuple
+        table_rows = []
+        for idx, item in enumerate(cards_with_retention):
+            c = item["card"]
+            # Highlight active card in the table
+            prefix = "▶ " if idx == st.session_state.card_index else ""
+            table_rows.append({
+                "Current": f"{prefix}Card {idx + 1}",
+                "Subject": c.get("subject", "General"),
+                "Question": c.get("question", ""),
+                "Answer": c.get("answer", ""),
+                "Memory Retention": f"{item['retention']}%",
+                "Review Status": item["status"]
+            })
+            
+        queue_df = pd.DataFrame(table_rows)
         
-        st.subheader(f"Subject: {card['subject']}")
-        
-        # Display Forgetting Curve Metric
+        # Display neat interactive table
+        st.dataframe(
+            queue_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Current": st.column_config.TextColumn("Active", width="small"),
+                "Subject": st.column_config.TextColumn("Subject", width="medium"),
+                "Question": st.column_config.TextColumn("Question", width="large"),
+                "Answer": st.column_config.TextColumn("Answer", width="large"),
+                "Memory Retention": st.column_config.TextColumn("Retention", width="small"),
+                "Review Status": st.column_config.TextColumn("Status", width="medium"),
+            }
+        )
+
+        st.divider()
+
+        # --- 2. ACTIVE CARD REVIEW INTERFACE ---
+        active_item = cards_with_retention[st.session_state.card_index]
+        card = active_item["card"]
+        retention = active_item["retention"]
+        status = active_item["status"]
+        color = active_item["color"]
+
+        # Card Header & Controls
+        col_header, col_nav = st.columns([3, 1])
+        with col_header:
+            st.caption(f"Currently Reviewing: Card {st.session_state.card_index + 1} of {len(cards_with_retention)}")
+            st.subheader(f"Subject: {card['subject']}")
+        with col_nav:
+            if st.button("⏭️ Skip to Next Card"):
+                st.session_state.card_index = (st.session_state.card_index + 1) % len(cards_with_retention)
+                st.rerun()
+
+        # Active Question & Metric
         col_q, col_m = st.columns([3, 1])
+        with col_q:
+            st.markdown(f"### Q: {card['question']}")
         with col_m:
-            st.metric("Estimated Memory Retention", f"{retention}%")
+            st.metric("Memory Retention", f"{retention}%")
             st.markdown(f"<span style='color:{color}; font-weight:bold;'>{status}</span>", unsafe_allow_html=True)
 
-        with col_q:
-            # FIX: Properly display the card question
-            st.markdown(f"### Q: {card['question']}")
+        st.divider()
 
-        user_answer = st.text_area("Your Answer:", key=f"ans_{card['id']}")
-        
-        if st.button("Evaluate Answer"):
-            if not user_answer:
-                st.warning("Please enter an answer first.")
+        # User Answer Input
+        user_answer = st.text_area("Your Answer:", key=f"ans_{card['id']}", height=120)
+
+        col_btn1, col_btn2 = st.columns([1, 1])
+        with col_btn1:
+            eval_clicked = st.button("🤖 Evaluate Answer with AI", type="primary", use_container_width=True)
+        with col_btn2:
+            show_answer = st.button("👁️ Reveal Correct Answer", use_container_width=True)
+
+        # Direct Answer Reveal
+        if show_answer:
+            st.info(f"Correct Answer:")
+
+        # AI Evaluation Flow
+        if eval_clicked:
+            if not user_answer.strip():
+                st.warning("Please type an answer before requesting AI feedback.")
             else:
                 with st.spinner("AI evaluating your response..."):
                     eval_schema = types.Schema(
@@ -376,11 +445,18 @@ with tab2:
                         score = eval_data["score"]
                         feedback = eval_data["feedback"]
 
-                        st.markdown(f"**AI Grade:** {score}/5")
-                        st.markdown(f"**Feedback:** {feedback}")
-                        st.markdown(f"Actual Answer:")
+                        st.markdown("### AI Evaluation Result")
+                        if score >= 4:
+                            st.success(f"**Grade: {score}/5** — Excellent job!")
+                        elif score >= 2:
+                            st.warning(f"**Grade: {score}/5** — Getting there!")
+                        else:
+                            st.error(f"**Grade: {score}/5** — Needs review.")
 
-                        # Update database with SM-2 algorithm
+                        st.write(f"**Feedback:** {feedback}")
+                        st.info(f"Expected Answer:")
+
+                        # Update Spaced Repetition Parameters in Supabase
                         update_card_review(
                             card["id"],
                             score,
@@ -388,8 +464,11 @@ with tab2:
                             card.get("easiness_factor", 2.5),
                             card.get("repetition", 0)
                         )
-                        st.success("Card updated using Spaced Repetition + Forgetting Curve algorithm!")
+                        st.success("✅ Card memory schedule updated!")
 
+                        if st.button("Continue to Next Card ➔"):
+                            st.session_state.card_index = (st.session_state.card_index + 1) % len(cards_with_retention)
+                            st.rerun()
 # ------------------------------------------
 # TAB 3: DASHBOARD & FORGETTING CURVE STATUS
 # ------------------------------------------

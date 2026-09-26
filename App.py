@@ -8,6 +8,7 @@ import pandas as pd
 from supabase import create_client, Client
 from google import genai
 from google.genai import types
+import resend
 
 # ==========================================
 # 1. INITIALIZATION & CONFIGURATION
@@ -20,14 +21,21 @@ st.set_page_config(
 )
 
 # Initialize Supabase
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    st.error("Missing Supabase configuration. Set `SUPABASE_URL` and `SUPABASE_KEY` environment variables.")
+    st.error("Missing Supabase configuration. Set `SUPABASE_URL` and `SUPABASE_KEY` environment variables or secrets.")
     st.stop()
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Initialize Email (Resend)
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY") or st.secrets.get("RESEND_API_KEY", None)
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL") or st.secrets.get("SENDER_EMAIL", "onboarding@resend.dev")
+
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY
 
 # Initialize Session State
 if "user" not in st.session_state:
@@ -44,13 +52,13 @@ MODEL_CASCADE = [
 COOLDOWN_PERIOD_SECONDS = 60
 
 # ==========================================
-# 2. GEMINI FALLBACK PIPELINE
+# 2. GEMINI & EMAIL HELPERS
 # ==========================================
 
 def get_gemini_client() -> genai.Client:
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY")
     if not api_key:
-        st.error("Missing GEMINI_API_KEY environment variable.")
+        st.error("Missing GEMINI_API_KEY environment variable or secret.")
         st.stop()
     return genai.Client(api_key=api_key)
 
@@ -89,25 +97,55 @@ def call_gemini_with_fallback(prompt, response_schema=None, system_instruction: 
     st.error("All Gemini models are currently unavailable or rate-limited. Please wait a moment and try again.")
     return None
 
+def send_study_reminder(user_email: str, username: str, due_count: int, critical_cards: list) -> bool:
+    """Sends an email notification listing flashcards that are due for review."""
+    if not RESEND_API_KEY:
+        st.error("Resend API key is not configured.")
+        return False
+
+    card_items = "".join([f"<li><b>{c.get('subject', 'General')}</b>: {c.get('question', '')}</li>" for c in critical_cards[:5]])
+    
+    html_content = f"""
+    <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
+        <h2>🧠 Flashcard Review Reminder</h2>
+        <p>Hi <b>{username}</b>,</p>
+        <p>You have <b>{due_count} flashcards</b> that are experiencing high memory decay and need review today to maintain retention!</p>
+        
+        <h3>Top Priority Cards:</h3>
+        <ul>
+            {card_items}
+        </ul>
+        
+        <p>Open your Flashcard Hub to complete your review quiz!</p>
+    </div>
+    """
+
+    try:
+        params = {
+            "from": SENDER_EMAIL,
+            "to": [user_email],
+            "subject": f"🧠 You have {due_count} flashcards due for review!",
+            "html": html_content,
+        }
+        resend.Emails.send(params)
+        return True
+    except Exception as e:
+        st.error(f"Failed to send email to {user_email}: {e}")
+        return False
+
 # ==========================================
 # 3. FORGETTING CURVE & SM-2 LOGIC
 # ==========================================
 
 def calculate_forgetting_curve(last_reviewed: str, interval: int) -> tuple[float, str, str]:
-    """
-    Calculates retention percentage (R) using Ebbinghaus Forgetting Curve: R = e^(-t / S)
-    where t is elapsed time in days, and S is memory stability (interval in days).
-    """
     if not last_reviewed:
         return 0.0, "🔴 High Memory Decay (Needs Review)", "#FF4B4B"
 
     now = datetime.datetime.now(datetime.timezone.utc)
     
-    # Safely parse last_reviewed ISO string and enforce UTC timezone awareness
     try:
         clean_iso = str(last_reviewed).replace("Z", "+00:00")
         last_dt = datetime.datetime.fromisoformat(clean_iso)
-        # Convert naive datetime to UTC aware if timezone info is missing
         if last_dt.tzinfo is None:
             last_dt = last_dt.replace(tzinfo=datetime.timezone.utc)
         else:
@@ -118,7 +156,6 @@ def calculate_forgetting_curve(last_reviewed: str, interval: int) -> tuple[float
     elapsed_days = max((now - last_dt).total_seconds() / 86400.0, 0.001)
     stability = max(interval if interval is not None else 1, 1)
 
-    # Retention formula: R = e^(-t / S)
     retention = math.exp(-elapsed_days / stability) * 100
     retention_pct = round(retention, 1)
 
@@ -135,10 +172,8 @@ def calculate_forgetting_curve(last_reviewed: str, interval: int) -> tuple[float
     return retention_pct, status, color
 
 def update_card_review(card_id: str, quality: int, current_interval: int, current_ef: float, current_repetition: int):
-    """Updates card memory parameters using SuperMemo-2 (SM-2)."""
     quality = max(0, min(5, quality))
     
-    # Ensure current_ef and current_interval have valid fallbacks
     ef = float(current_ef) if current_ef is not None else 2.5
     interval = int(current_interval) if current_interval is not None else 1
     repetition = int(current_repetition) if current_repetition is not None else 0
@@ -176,7 +211,7 @@ def update_card_review(card_id: str, quality: int, current_interval: int, curren
         st.error(f"Failed to update review status in database: {e}")
 
 # ==========================================
-# 4. AUTHENTICATION & USER MANAGEMENT
+# 4. AUTHENTICATION
 # ==========================================
 
 def login_user(username, password):
@@ -196,7 +231,7 @@ def login_user(username, password):
         else:
             st.error("User not found.")
     except Exception as e:
-        st.error("Database connection failed. Please check if your Supabase project is active or verify your SUPABASE_URL environment variable.")
+        st.error("Database connection failed. Check your Supabase configuration.")
 
 def register_user(username, password):
     res = supabase.table("users").select("*").eq("username", username).execute()
@@ -209,7 +244,6 @@ def register_user(username, password):
     if new_user.data:
         st.success("Account created successfully! Please log in.")
 
-# Auth Screen
 if not st.session_state.user:
     st.title("🧠 Multi-User AI Flashcard Hub")
     auth_tab1, auth_tab2 = st.tabs(["Login", "Register"])
@@ -228,7 +262,7 @@ if not st.session_state.user:
             
     st.stop()
 
-# Logout in sidebar
+# Sidebar User Info & Logout
 st.sidebar.write(f"Logged in as: **{st.session_state.user['username']}**")
 if st.sidebar.button("Log Out"):
     st.session_state.user = None
@@ -246,7 +280,6 @@ tab1, tab2, tab3 = st.tabs(["⚡ Generate Cards", "🎴 Smart Quiz", "📚 Dashb
 with tab1:
     st.header("⚡ Generate & View Flashcards")
     
-    # 1. Generation Form
     subject = st.text_input("Subject / Topic", placeholder="e.g., Organic Chemistry, Cybersecurity")
     input_text = st.text_area("Source Material or Notes", height=150)
     uploaded_file = st.file_uploader("Or Upload Document/Image", type=["txt", "pdf", "png", "jpg"])
@@ -316,7 +349,7 @@ with tab1:
 
     st.divider()
 
-    # 2. Flashcard Inventory Table in Tab 1
+    # Flashcard Inventory Table in Tab 1
     st.subheader("📋 Flashcard Inventory")
     res = supabase.table("flashcards").select("*").eq("user_id", st.session_state.user["id"]).execute()
     cards = res.data or []
@@ -351,7 +384,7 @@ with tab1:
         )
 
 # ------------------------------------------
-# TAB 2: SMART QUIZ (CLEANED UP & STREAMLINED)
+# TAB 2: SMART QUIZ
 # ------------------------------------------
 with tab2:
     st.header("🎴 Smart Quiz & Self-Evaluation")
@@ -455,11 +488,12 @@ with tab2:
                         if st.button("Continue to Next Card ➔"):
                             st.session_state.card_index = (st.session_state.card_index + 1) % len(cards_with_retention)
                             st.rerun()
+
 # ------------------------------------------
-# TAB 3: DASHBOARD & FORGETTING CURVE STATUS
+# TAB 3: DASHBOARD & RETENTION
 # ------------------------------------------
 with tab3:
-    st.header("Deck Management & Retention Tracking")
+    st.header("📚 Dashboard & Retention Tracking")
     
     res = supabase.table("flashcards").select("*").eq("user_id", st.session_state.user["id"]).execute()
     cards = res.data or []
@@ -482,7 +516,6 @@ with tab3:
 
         df = pd.DataFrame(table_data)
         
-        # Summary metrics
         m1, m2, m3 = st.columns(3)
         m1.metric("Total Cards", len(cards))
         avg_retention = round(sum([float(x["Retention %"].replace("%", "")) for x in table_data]) / len(cards), 1)
@@ -493,9 +526,37 @@ with tab3:
         st.markdown("### Flashcard Inventory")
         st.dataframe(df.drop(columns=["ID"]), use_container_width=True)
 
-        # Individual Card Deletion
+        st.divider()
+
+        # Email Notifications Section
+        st.subheader("📧 Email Notifications")
+        user_email = st.text_input("Notification Email Address", value=st.session_state.user.get("email", ""))
+
+        if st.button("Save Email & Send Review Summary"):
+            if not user_email:
+                st.warning("Please enter a valid email address.")
+            else:
+                supabase.table("users").update({"email": user_email}).eq("id", st.session_state.user["id"]).execute()
+                st.session_state.user["email"] = user_email
+                
+                due_cards = [c for c in cards if calculate_forgetting_curve(c.get("last_reviewed"), c.get("interval", 1))[0] < 50]
+                
+                if due_cards:
+                    success = send_study_reminder(user_email, st.session_state.user["username"], len(due_cards), due_cards)
+                    if success:
+                        st.success(f"Review digest sent to {user_email}!")
+                else:
+                    st.info("Your retention is strong across all cards! No digest needed right now.")
+
+        st.divider()
+
+        # Manage Cards Section
         st.markdown("### Manage Cards")
-        delete_id = st.selectbox("Select Card to Delete", options=[c["ID"] for c in table_data], format_func=lambda x: next(item["Question"] for item in table_data if item["ID"] == x))
+        delete_id = st.selectbox(
+            "Select Card to Delete",
+            options=[c["ID"] for c in table_data],
+            format_func=lambda x: next(item["Question"] for item in table_data if item["ID"] == x)
+        )
         if st.button("Delete Selected Card"):
             supabase.table("flashcards").delete().eq("id", delete_id).execute()
             st.success("Card deleted successfully!")

@@ -1,6 +1,6 @@
 streamlit
-google-genai
 supabase
+google-genai
 bcrypt
-pypdf
-Pillow
+pandas
+resend

@@ -9,6 +9,7 @@ from supabase import create_client, Client
 from google import genai
 from google.genai import types
 import resend
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # ==========================================
 # 1. INITIALIZATION & CONFIGURATION
@@ -88,7 +89,6 @@ def call_gemini_with_fallback(prompt, response_schema=None, system_instruction: 
         except Exception as e:
             error_msg = str(e).lower()
             if "429" in error_msg or "503" in error_msg or "quota" in error_msg:
-                # Silently log cooldown to session state without showing st.warning popups
                 st.session_state.model_cooldowns[model] = now + datetime.timedelta(seconds=COOLDOWN_PERIOD_SECONDS)
                 continue
             else:
@@ -100,7 +100,7 @@ def call_gemini_with_fallback(prompt, response_schema=None, system_instruction: 
 def send_study_reminder(user_email: str, username: str, due_count: int, critical_cards: list) -> bool:
     """Sends an email notification listing flashcards that are due for review."""
     if not RESEND_API_KEY:
-        st.error("Resend API key is not configured.")
+        print("Resend API key is not configured.")
         return False
 
     card_items = "".join([f"<li><b>{c.get('subject', 'General')}</b>: {c.get('question', '')}</li>" for c in critical_cards[:5]])
@@ -116,7 +116,7 @@ def send_study_reminder(user_email: str, username: str, due_count: int, critical
             {card_items}
         </ul>
         
-        <p>Open your Flashcard Hub to complete your review quiz!</p>
+        <p>Log in to your app to complete your review quiz!</p>
     </div>
     """
 
@@ -124,17 +124,57 @@ def send_study_reminder(user_email: str, username: str, due_count: int, critical
         params = {
             "from": SENDER_EMAIL,
             "to": [user_email],
-            "subject": f"🧠 You have {due_count} flashcards due for review!",
+            "subject": f"🧠 Daily Review: {due_count} flashcard(s) due!",
             "html": html_content,
         }
         resend.Emails.send(params)
         return True
     except Exception as e:
-        st.error(f"Failed to send email to {user_email}: {e}")
+        print(f"Failed to send email to {user_email}: {e}")
         return False
 
 # ==========================================
-# 3. FORGETTING CURVE & SM-2 LOGIC
+# 3. BACKGROUND SCHEDULER (AUTOMATED EMAILS)
+# ==========================================
+
+def check_and_send_daily_emails():
+    """Background task running daily to check all users and email those with due cards."""
+    try:
+        users_res = supabase.table("users").select("id, username, email").not_.is_("email", "null").execute()
+        users = users_res.data or []
+
+        for user in users:
+            email = user.get("email")
+            username = user.get("username")
+            if not email:
+                continue
+
+            cards_res = supabase.table("flashcards").select("*").eq("user_id", user["id"]).execute()
+            cards = cards_res.data or []
+
+            due_cards = [
+                c for c in cards
+                if calculate_forgetting_curve(c.get("last_reviewed"), c.get("interval", 1))[0] < 50
+            ]
+
+            if due_cards:
+                send_study_reminder(email, username, len(due_cards), due_cards)
+    except Exception as e:
+        print(f"Error executing daily email cron job: {e}")
+
+@st.cache_resource
+def start_email_scheduler():
+    """Starts the background scheduler once when Streamlit runs."""
+    scheduler = BackgroundScheduler()
+    # Schedule job daily at 8:00 AM server time
+    scheduler.add_job(check_and_send_daily_emails, 'cron', hour=8, minute=0)
+    scheduler.start()
+    return scheduler
+
+start_email_scheduler()
+
+# ==========================================
+# 4. FORGETTING CURVE & SM-2 LOGIC
 # ==========================================
 
 def calculate_forgetting_curve(last_reviewed: str, interval: int) -> tuple[float, str, str]:
@@ -211,7 +251,7 @@ def update_card_review(card_id: str, quality: int, current_interval: int, curren
         st.error(f"Failed to update review status in database: {e}")
 
 # ==========================================
-# 4. AUTHENTICATION
+# 5. AUTHENTICATION
 # ==========================================
 
 def login_user(username, password):
@@ -269,7 +309,7 @@ if st.sidebar.button("Log Out"):
     st.rerun()
 
 # ==========================================
-# 5. MAIN APPLICATION TABS
+# 6. MAIN APPLICATION TABS
 # ==========================================
 
 tab1, tab2, tab3 = st.tabs(["⚡ Generate Cards", "🎴 Smart Quiz", "📚 Dashboard & Retention"])
@@ -363,7 +403,7 @@ with tab1:
             table_rows.append({
                 "Subject": c.get("subject", "General"),
                 "Question": c.get("question", ""),
-                "Answer": c.get("answer", ""),
+                "Answer": c.get("answer") or c.get("Answer") or "",
                 "Retention": f"{ret}%",
                 "Status": status
             })
@@ -435,17 +475,16 @@ with tab2:
         with col_btn2:
             show_answer = st.button("👁️ Reveal Correct Answer", use_container_width=True)
 
-        if show_answer:
-            st.info(f"Correct Answer:")
+        correct_answer = card.get("answer") or card.get("Answer") or "No answer specified for this card."
 
-       # AI Evaluation Flow
+        if show_answer:
+            st.info(f"**Correct Answer:** {correct_answer}")
+
+        # AI Evaluation Flow
         if eval_clicked:
             if not user_answer.strip():
                 st.warning("Please type an answer before requesting AI feedback.")
             else:
-                # Retrieve answer safely
-                correct_answer = card.get("answer") or card.get("Answer") or "No answer specified for this card."
-
                 with st.spinner("AI evaluating your response..."):
                     eval_schema = types.Schema(
                         type=types.Type.OBJECT,
@@ -532,25 +571,17 @@ with tab3:
 
         st.divider()
 
-        # Email Notifications Section
-        st.subheader("📧 Email Notifications")
+        # Email Settings Section
+        st.subheader("📧 Automatic Email Notifications")
         user_email = st.text_input("Notification Email Address", value=st.session_state.user.get("email", ""))
 
-        if st.button("Save Email & Send Review Summary"):
+        if st.button("Save Email Preferences"):
             if not user_email:
                 st.warning("Please enter a valid email address.")
             else:
                 supabase.table("users").update({"email": user_email}).eq("id", st.session_state.user["id"]).execute()
                 st.session_state.user["email"] = user_email
-                
-                due_cards = [c for c in cards if calculate_forgetting_curve(c.get("last_reviewed"), c.get("interval", 1))[0] < 50]
-                
-                if due_cards:
-                    success = send_study_reminder(user_email, st.session_state.user["username"], len(due_cards), due_cards)
-                    if success:
-                        st.success(f"Review digest sent to {user_email}!")
-                else:
-                    st.info("Your retention is strong across all cards! No digest needed right now.")
+                st.success(f"Email saved! You will receive automatic daily reminders at {user_email} whenever flashcards need review.")
 
         st.divider()
 

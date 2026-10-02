@@ -88,13 +88,13 @@ def call_gemini_with_fallback(prompt, response_schema=None, system_instruction: 
         except Exception as e:
             error_msg = str(e).lower()
             if "429" in error_msg or "503" in error_msg or "quota" in error_msg:
+                # Silently log cooldown to session state without showing st.warning popups
                 st.session_state.model_cooldowns[model] = now + datetime.timedelta(seconds=COOLDOWN_PERIOD_SECONDS)
-                st.warning(f"Model {model} busy/rate-limited. Falling back to next available model...")
                 continue
             else:
                 break
 
-    st.error("All Gemini models are currently unavailable or rate-limited. Please wait a moment and try again.")
+    st.error("All Gemini models are currently busy. Please wait a moment and try again.")
     return None
 
 def send_study_reminder(user_email: str, username: str, due_count: int, critical_cards: list) -> bool:
@@ -438,21 +438,25 @@ with tab2:
         if show_answer:
             st.info(f"Correct Answer:")
 
+       # AI Evaluation Flow
         if eval_clicked:
             if not user_answer.strip():
                 st.warning("Please type an answer before requesting AI feedback.")
             else:
+                # Retrieve answer safely
+                correct_answer = card.get("answer") or card.get("Answer") or "No answer specified for this card."
+
                 with st.spinner("AI evaluating your response..."):
                     eval_schema = types.Schema(
                         type=types.Type.OBJECT,
                         properties={
-                            "score": types.Schema(type=types.Type.INTEGER, description="Grade from 0 (completely wrong) to 5 (perfect execution)"),
-                            "feedback": types.Schema(type=types.Type.STRING, description="Constructive feedback explaining the grade")
+                            "score": types.Schema(type=types.Type.INTEGER, description="Grade from 0 to 5"),
+                            "feedback": types.Schema(type=types.Type.STRING, description="Feedback explaining the score")
                         },
                         required=["score", "feedback"]
                     )
                     
-                    eval_prompt = f"Correct Answer: {card['answer']}\nUser Answer: {user_answer}\nEvaluate accuracy and grade 0-5."
+                    eval_prompt = f"Correct Answer: {correct_answer}\nUser Answer: {user_answer}\nEvaluate accuracy and grade 0-5."
                     
                     eval_res = call_gemini_with_fallback(
                         prompt=eval_prompt,
@@ -462,8 +466,8 @@ with tab2:
 
                     if eval_res:
                         eval_data = json.loads(eval_res)
-                        score = eval_data["score"]
-                        feedback = eval_data["feedback"]
+                        score = eval_data.get("score", 0)
+                        feedback = eval_data.get("feedback", "")
 
                         st.markdown("### AI Evaluation Result")
                         if score >= 4:
@@ -474,7 +478,7 @@ with tab2:
                             st.error(f"**Grade: {score}/5** — Needs review.")
 
                         st.write(f"**Feedback:** {feedback}")
-                        st.info(f"Expected Answer:")
+                        st.info(f"**Expected Answer:** {correct_answer}")
 
                         update_card_review(
                             card["id"],

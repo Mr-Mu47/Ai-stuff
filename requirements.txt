@@ -1,6 +1,7 @@
 streamlit
 supabase
 google-genai
+resend
+apscheduler
 bcrypt
 pandas
-resend

@@ -1,4 +1,5 @@
 import os
+import re
 import math
 import datetime
 import bcrypt
@@ -59,6 +60,7 @@ MODEL_CASCADE = [
 COOLDOWN_PERIOD_SECONDS = 60
 MISSING_MODEL_COOLDOWN_SECONDS = 3600
 MIN_PASSWORD_LENGTH = 8
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # ==========================================
 # 2. GEMINI & EMAIL HELPERS
@@ -287,36 +289,55 @@ def login_user(username, password):
     except Exception as e:
         st.error("Database connection failed. Check your Supabase configuration.")
 
-def register_user(username, password):
-    # FIX #5: validation + error handling (incl. duplicate-username race).
+def register_user(username, email, password):
+    # Validation + error handling (incl. duplicate username/email race).
     username = (username or "").strip()
-    if not username or not password:
-        st.error("Please provide both a username and a password.")
+    email = (email or "").strip().lower()
+    if not username or not email or not password:
+        st.error("Please provide a username, an email address, and a password.")
+        return
+    if not EMAIL_PATTERN.match(email):
+        st.error("Please enter a valid email address.")
         return
     if len(password) < MIN_PASSWORD_LENGTH:
         st.error(f"Password must be at least {MIN_PASSWORD_LENGTH} characters long.")
         return
 
+    new_user_record = None
     try:
         res = supabase.table("users").select("id").eq("username", username).execute()
         if res.data:
             st.error("Username already taken.")
             return
 
+        res = supabase.table("users").select("id").eq("email", email).execute()
+        if res.data:
+            st.error("An account with that email address already exists.")
+            return
+
         hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-        new_user = supabase.table("users").insert({"username": username, "password_hash": hashed}).execute()
+        new_user = supabase.table("users").insert({
+            "username": username,
+            "email": email,
+            "password_hash": hashed
+        }).execute()
         if new_user.data:
-            st.success("Account created successfully! Please log in.")
+            new_user_record = new_user.data[0]
         else:
             st.error("Could not create the account. Please try again.")
     except Exception as e:
-        # Covers a unique-constraint violation if two people register the same name at once.
+        # Covers a unique-constraint violation if two people register at once.
         msg = str(e).lower()
         if "duplicate" in msg or "unique" in msg or "23505" in msg:
-            st.error("Username already taken.")
+            st.error("That username or email address is already in use.")
         else:
             st.error("Registration failed. Please try again.")
             print(f"Registration error: {e}")
+
+    # Auto-login: same session state that login_user() sets.
+    if new_user_record:
+        st.session_state.user = new_user_record
+        st.rerun()
 
 if not st.session_state.user:
     st.title("🧠 Multi-User AI Flashcard Hub")
@@ -330,9 +351,10 @@ if not st.session_state.user:
 
     with auth_tab2:
         u_reg = st.text_input("Username", key="reg_u")
+        e_reg = st.text_input("Email", key="reg_e")
         p_reg = st.text_input("Password", type="password", key="reg_p")
         if st.button("Register Account"):
-            register_user(u_reg, p_reg)
+            register_user(u_reg, e_reg, p_reg)
 
     st.stop()
 
